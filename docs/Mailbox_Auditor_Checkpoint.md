@@ -2,7 +2,22 @@
 
 Status: ready for independent audit of the mailbox/step tranche, with a restored Release suite passing 77/77 tests. The preceding commit `affb92d206242a21fc2032d51016cd0f29e7e54f` is the historical 46-test baseline. The Bozzetto peer is the intended auditor; no deployment or consumer adoption follows merely from this document.
 
+Implementation and package source pin:
+[`5f87a548f28360bd91fe59c4c10dd014b544d9ad`](https://forge.spkez.dev/FidelityFramework/Fidelity.FSharp.Incremental/src/commit/5f87a548f28360bd91fe59c4c10dd014b544d9ad).
+The following documentation checkpoint adds distribution receipts without changing
+that implementation. Both local `0.1.0-preview.2` packages identify this source pin;
+an isolated package-only consumer built and ran the mailbox sample successfully.
+No package feed publication, compiler promotion or service replacement occurred.
+
 Return the assessment in `docs/Mailbox_Auditor_Assessment_2026-10-01.md`, identifying the reviewed commit, evidence checked, concrete findings and remaining adoption conditions. That assessment has not been authored here on the auditor's behalf.
+
+From this repository, using .NET SDK 10.0.401 and the existing shared build lease:
+
+```sh
+dotnet build Fidelity.FSharp.Incremental.slnx -c Release
+dotnet test tests/Fidelity.FSharp.Incremental.Tests/Fidelity.FSharp.Incremental.Tests.fsproj -c Release
+dotnet run --project samples/MailboxSteps/MailboxSteps.fsproj -c Release
+```
 
 The bounded claim is that immutable dependency bookkeeping can retain an owned logical attempt across a resource-free suspension, resume one exact checkpoint once, and serialize commands through a responsive .NET coordinator. [Steps and Mailboxes](Steps_and_Mailboxes.md) defines the distinction between a logical attempt, active step, queue admission and acknowledged reservation.
 

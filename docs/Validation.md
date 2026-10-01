@@ -49,6 +49,28 @@ These identify the tested pre-commit build; any subsequent package build has its
 own distribution receipt. See [the auditor checkpoint](Mailbox_Auditor_Checkpoint.md)
 for review scope and consumer acceptance work.
 
+The implementation was then committed as
+`5f87a548f28360bd91fe59c4c10dd014b544d9ad`. Both preview.2 packages were built
+from that clean commit and their NuGet repository metadata carries that exact pin.
+The core depends on FSharp.Core 10.1.401; Hosting adds the core package. An isolated
+console project with only a Hosting `PackageReference` restored, built and ran
+the complete mailbox sample successfully, with no project references. Its assets
+contain exactly those three packages. This validates local distribution shape and
+the exercised public API, not consumer adoption or package-feed publication.
+
+| Local preview.2 package | SHA256 |
+| --- | --- |
+| Core | `ae864026be098e0c6f705fa15dcdc2daabc4baa1fb8bf2d66b71a83b6655e928` |
+| Hosting | `3abf1880af74235290aa2a594648aa8aa264d73e916e2a676b2ea338bb0f6474` |
+
+Packaging regenerated assembly metadata for the committed source. The packaged
+core assembly SHA256 is
+`af6877134ea2d4990e2dea3fec4601d9a177868eb0d9668e4d05af2d46af9c75`;
+the packaged Hosting assembly is
+`590a178f77a12f354d9fb0725dc93bf1b2cacd61d57d9de86669bc42fc67e23e`.
+The external validation directory also contains `source.sha256`,
+`tested-binaries.sha256`, package archives and `package-consumer.log`.
+
 ## Original foundation — preview.1
 
 Both the first Debug suite and the final Release suite passed **46/46 tests, with zero failures or skips** on .NET 10. Each contains 36 core tests and 10 host tests. Release testing includes drained-attempt compaction and two strengthened post-drain assertions. The six preceding attempts stopped at source or test-helper compilation errors; they are retained as build evidence and do not count as executed semantic tests.
