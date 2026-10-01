@@ -7,6 +7,12 @@ and the complete Release suite passes **84/84**. This response is author evidenc
 for follow-up review; it does not replace the auditor's assessment or declare
 consumer integration complete.
 
+Implementation/package source:
+[`c7fbcd17daf9bbc54b49559975a34617818f44bf`](https://forge.spkez.dev/FidelityFramework/Fidelity.FSharp.Incremental/src/commit/c7fbcd17daf9bbc54b49559975a34617818f44bf).
+The following documentation commit only adds these distribution receipts. The
+independent assessment is preserved verbatim (SHA256
+`ee20df2a721cc31a8c1827445386da7cedf4428fbfa0f4c6b281deb9240d02e3`).
+
 ## Repair and retained boundaries
 
 `Running.Done` now records physical completion independently of protocol validity.
@@ -68,7 +74,7 @@ Raw evidence is external at
 `/home/hhh/.codex/work/incremental-host-fault-2026-10-01/`: `red.log` is compile-only,
 `red-executed.trx` records the three failures and control, `green-focused.trx`
 records the initial repaired cases, and `release-final.trx` records all 84.
-Source and tested-binary hashes accompany the logs. The restored test receipt
+Source and tested-binary hashes accompany the logs. The final test receipt
 SHA256 is `c085da659334e176d8593127668307c8ed10ecab5608e92010169689d65f7286`.
 The Release solution build also passed with zero warnings or errors. Both samples
 passed: the original host retained the 3→2 selective-work ratio, and the mailbox
@@ -79,6 +85,24 @@ An independent local source review checked the final lifetime ordering. LAN TWO'
 bounded review of the old source confirmed existing concerns but also contained
 incorrect causal claims; those were rejected in its external disposition. That
 advisory review is separate from the executed regression and the consumer auditor.
+
+## Local distribution check
+
+Both `0.1.0-preview.3` packages were built from the implementation pin above and
+carry it in their NuGet metadata. An isolated console consumer restored only
+Hosting, the core and FSharp.Core 10.1.401, with no project references. It built
+and reproduced the original host's selective-reuse sample and checked that the
+only public `Host` constructor still has three arguments. The injection seam is
+internal. Packages remain local; no feed publication occurred.
+
+| Package | SHA256 |
+| --- | --- |
+| Core | `70d39c6c3438b54c18b48accdf66620dc2d3ab219814cda9e83c8fc9e524c83f` |
+| Hosting | `85befa6899913a17b144be25278274eda0457a8be107bc33762fc5a83f542fad` |
+
+Archives and `package-consumer.log` are in the external evidence directory.
+Packaged assemblies include metadata for the committed pin and are distinct
+from the pre-commit test-build hashes; they are not substituted into that receipt.
 
 ## Consumer gates and follow-up
 
