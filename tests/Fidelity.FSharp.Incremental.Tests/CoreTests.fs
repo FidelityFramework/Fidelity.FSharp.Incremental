@@ -528,3 +528,224 @@ type CoreTests() =
             CoreChecks.same expectedVisits (visits |> Map.toSeq |> Seq.map fst |> Set.ofSeq)
             for KeyValue(_, count) in visits do CoreChecks.same 1 count
             assertFresh()
+
+module private SuspensionChecks =
+    let hold step environment (request: StartRequest) state =
+        let next, effects = CoreChecks.step (Action.Suspend(request.Attempt, StepId step, CoreChecks.token environment)) state
+        let handles =
+            effects |> List.choose (fun effect ->
+                match effect.Action with EffectAction.Suspended handle -> Some handle | _ -> None)
+        match handles with
+        | [handle] -> next, handle, effects
+        | found -> failwithf "Expected one suspension, got %A" found
+
+    let initial reads =
+        let state, request = CoreChecks.initial [CoreChecks.define 1 1 reads] |> CoreChecks.start 1
+        let held, handle, _ = hold 7UL 91 request state
+        held, request, handle
+
+    let continued effects =
+        effects |> List.choose (fun effect ->
+            match effect.Action with EffectAction.Continue request -> Some request | _ -> None)
+
+[<TestFixture>]
+type SuspensionTests() =
+    [<Test>]
+    member _.``Suspension holds logical ownership without offering a result``() =
+        let state, request, handle = SuspensionChecks.initial [CoreChecks.fromInput 1 1]
+        CoreChecks.same (CoreChecks.epoch, request.Attempt, StepId 7UL, CoreChecks.token 91)
+            (handle.Epoch, handle.Attempt, handle.Step, handle.Environment)
+        CoreChecks.same 1 (Core.pendingAttempts state)
+        CoreChecks.same (Some handle) (Core.trySuspension request.Attempt state)
+        CoreChecks.same None (Core.tryActiveRequest request.Attempt state)
+        CoreChecks.same (WorkStatus.AwaitingResume handle) (CoreChecks.view 1 state).Status
+        CoreChecks.same None (Core.tryResult (CoreChecks.work 1) state)
+
+    [<Test>]
+    member _.``Resume emits the exact response and original request before terminal drain``() =
+        let state, request, handle = SuspensionChecks.initial [CoreChecks.fromInput 1 1]
+        let resumed, effects = CoreChecks.step (Action.Resume(handle, CoreChecks.token 123)) state
+        let expected: ResumeRequest = { Start = request; Suspension = handle; Response = CoreChecks.token 123 }
+        CoreChecks.same [expected] (SuspensionChecks.continued effects)
+        CoreChecks.same [] (CoreChecks.starts effects)
+        CoreChecks.same [] (CoreChecks.offers effects)
+        CoreChecks.same None (Core.trySuspension request.Attempt resumed)
+        CoreChecks.same (Some request) (Core.tryActiveRequest request.Attempt resumed)
+        CoreChecks.same 1 (Core.pendingAttempts resumed)
+        let finished = CoreChecks.advance (Action.Finished(request.Attempt, Completion.Succeeded(CoreChecks.token 41))) resumed
+        CoreChecks.same None (Core.tryActiveRequest request.Attempt finished)
+        CoreChecks.same None (Core.tryResult (CoreChecks.work 1) finished)
+        let drained, after = CoreChecks.step (Action.Drained request.Attempt) finished
+        CoreChecks.same [CoreChecks.result 1 drained] (CoreChecks.offers after)
+        CoreChecks.same request.Attempt (CoreChecks.result 1 drained).Attempt
+
+    [<Test>]
+    member _.``A consumed resume handle cannot execute twice or reappear after drain``() =
+        let state, request, handle = SuspensionChecks.initial []
+        let resumed = CoreChecks.advance (Action.Resume(handle, CoreChecks.token 1)) state
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) resumed
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 2)) resumed
+        let finished, _ = CoreChecks.succeed request 3 resumed
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) finished
+        CoreChecks.same (CoreChecks.token 3) (CoreChecks.result 1 finished).Value
+
+    [<Test>]
+    member _.``Every resume handle field belongs to its exact current suspension``() =
+        let state, _, handle = SuspensionChecks.initial []
+        let forged = [
+            { handle with Id = SuspensionId 900UL }
+            { handle with Attempt = AttemptId 900UL }
+            { handle with Step = StepId 900UL }
+            { handle with Environment = CoreChecks.token 900 }
+        ]
+        for changed in forged do
+            CoreChecks.rejects (ProtocolError.InvalidSuspension changed.Id) (Action.Resume(changed, CoreChecks.token 1)) state
+        let foreign = { handle with Epoch = EpochId 900UL }
+        CoreChecks.rejects ProtocolError.ForeignEpoch (Action.Resume(foreign, CoreChecks.token 1)) state
+        let _, valid = CoreChecks.step (Action.Resume(handle, CoreChecks.token 1)) state
+        CoreChecks.same 1 (SuspensionChecks.continued valid).Length
+
+    [<Test>]
+    member _.``Only one checkpoint is held and later suspensions allocate new identities``() =
+        let state, request, first = SuspensionChecks.initial []
+        CoreChecks.rejects (ProtocolError.AlreadySuspended request.Attempt)
+            (Action.Suspend(request.Attempt, StepId 8UL, CoreChecks.token 92)) state
+        let resumed = CoreChecks.advance (Action.Resume(first, CoreChecks.token 1)) state
+        let held, second, _ = SuspensionChecks.hold 7UL 91 request resumed
+        CoreChecks.check (second.Id > first.Id) "Later checkpoint reused an old suspension identity"
+        CoreChecks.same (first.Step, first.Environment) (second.Step, second.Environment)
+        CoreChecks.rejects (ProtocolError.InvalidSuspension first.Id) (Action.Resume(first, CoreChecks.token 1)) held
+        let _, effects = CoreChecks.step (Action.Resume(second, CoreChecks.token 2)) held
+        CoreChecks.same second (SuspensionChecks.continued effects |> List.exactlyOne).Suspension
+
+    [<Test>]
+    member _.``Held checkpoints reject success but permit failure or cancellation cleanup``() =
+        for outcome in [Completion.Failed { Code = "step"; Message = "controlled failure" }; Completion.Cancelled] do
+            let state, request, handle = SuspensionChecks.initial []
+            CoreChecks.rejects (ProtocolError.SuccessWhileSuspended request.Attempt)
+                (Action.Finished(request.Attempt, Completion.Succeeded(CoreChecks.token 1))) state
+            let finished, effects = CoreChecks.step (Action.Finished(request.Attempt, outcome)) state
+            CoreChecks.same 1 (CoreChecks.countEffect (EffectAction.Drain request.Attempt) effects)
+            CoreChecks.same None (Core.trySuspension request.Attempt finished)
+            CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) finished
+            let drained, after = CoreChecks.step (Action.Drained request.Attempt) finished
+            CoreChecks.same 0 (Core.pendingAttempts drained)
+            CoreChecks.same [] (CoreChecks.offers after)
+
+    [<Test>]
+    member _.``Reservation revokes suspension even when the definition is retained``() =
+        let state, request, handle = SuspensionChecks.initial []
+        let reserved, effects = CoreChecks.step (Action.ReserveScope(CoreChecks.scope, CoreChecks.revision 2)) state
+        CoreChecks.same 1 (CoreChecks.countEffect (EffectAction.Cancel request.Attempt) effects)
+        CoreChecks.same None (Core.trySuspension request.Attempt reserved)
+        CoreChecks.same None (Core.tryActiveRequest request.Attempt reserved)
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) reserved
+        let replaced, after =
+            CoreChecks.step (Action.ReplaceScope(CoreChecks.scope, CoreChecks.revision 2, [ScopeEntry.Retain(CoreChecks.work 1)])) reserved
+        CoreChecks.same [] (CoreChecks.starts after)
+        let finished = CoreChecks.advance (Action.Finished(request.Attempt, Completion.Cancelled)) replaced
+        let _, ready = CoreChecks.step (Action.Drained request.Attempt) finished
+        let next = CoreChecks.started 1 ready
+        CoreChecks.check (next.Attempt <> request.Attempt) "Old checkpoint became the replacement attempt"
+        CoreChecks.same (CoreChecks.revision 2) next.Revision
+        CoreChecks.same [] (SuspensionChecks.continued ready)
+
+    [<Test>]
+    member _.``Changed input invalidates a checkpoint and replacement reads fresh input``() =
+        let state, request, handle = SuspensionChecks.initial [CoreChecks.fromInput 1 1]
+        let changed = CoreChecks.advance (Action.SetInputs [CoreChecks.inputValue 1 2 20]) state
+        CoreChecks.same None (Core.trySuspension request.Attempt changed)
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) changed
+        let finished = CoreChecks.advance (Action.Finished(request.Attempt, Completion.Cancelled)) changed
+        let _, effects = CoreChecks.step (Action.Drained request.Attempt) finished
+        let next = CoreChecks.started 1 effects
+        CoreChecks.same [{ Slot = ReadSlotId 1UL; Value = ReadValue.Input(InputId 1UL, InputStamp 2UL, CoreChecks.token 20) }] next.Reads
+        CoreChecks.same [] (SuspensionChecks.continued effects)
+
+    [<Test>]
+    member _.``Declared response inputs govern resumed result retention and invalidation``() =
+        // The fixture owner ties the response to input 1. Resume itself does not
+        // discover this dependency or prove an opaque token's provenance.
+        let held, request, handle = SuspensionChecks.initial [CoreChecks.fromInput 1 1]
+        let resumed = CoreChecks.advance (Action.Resume(handle, CoreChecks.token 10)) held
+        let completed, _ = CoreChecks.succeed request 11 resumed
+        let original = CoreChecks.result 1 completed
+        let reserved = CoreChecks.advance (Action.ReserveScope(CoreChecks.scope, CoreChecks.revision 2)) completed
+        let retained, effects =
+            CoreChecks.step (Action.ReplaceScope(CoreChecks.scope, CoreChecks.revision 2, [ScopeEntry.Retain(CoreChecks.work 1)])) reserved
+        let current = CoreChecks.result 1 retained
+        CoreChecks.same [] (CoreChecks.starts effects)
+        CoreChecks.same [] (SuspensionChecks.continued effects)
+        CoreChecks.same (original.Attempt, original.Value) (current.Attempt, current.Value)
+        CoreChecks.check (current.Eligibility <> original.Eligibility) "Retention reused the revoked eligibility"
+        CoreChecks.check (not (Core.isEligible original retained)) "Old revision handle remained eligible"
+        let changed, restarted = CoreChecks.step (Action.SetInputs [CoreChecks.inputValue 1 2 20]) retained
+        CoreChecks.same [current] (CoreChecks.withdrawals restarted)
+        CoreChecks.check (not (Core.isEligible current changed)) "Changed declared response input retained an old result"
+        CoreChecks.same None (Core.tryResult (CoreChecks.work 1) changed)
+        let next = CoreChecks.started 1 restarted
+        CoreChecks.check (next.Attempt <> request.Attempt) "Changed response input reused the original attempt"
+        CoreChecks.same [{ Slot = ReadSlotId 1UL; Value = ReadValue.Input(InputId 1UL, InputStamp 2UL, CoreChecks.token 20) }] next.Reads
+        let heldAgain, newHandle, _ = SuspensionChecks.hold 7UL 92 next changed
+        let resumedAgain = CoreChecks.advance (Action.Resume(newHandle, CoreChecks.token 20)) heldAgain
+        let final, _ = CoreChecks.succeed next 21 resumedAgain
+        CoreChecks.same (CoreChecks.token 21) (CoreChecks.result 1 final).Value
+
+    [<Test>]
+    member _.``Last demand release revokes checkpoint and late success cannot offer``() =
+        let state, request, handle = SuspensionChecks.initial []
+        let released, effects = CoreChecks.step (Action.Release(CoreChecks.demand 1)) state
+        CoreChecks.same 1 (CoreChecks.countEffect (EffectAction.Cancel request.Attempt) effects)
+        CoreChecks.same 1 (Core.pendingAttempts released)
+        CoreChecks.same None (Core.trySuspension request.Attempt released)
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) released
+        let finished = CoreChecks.advance (Action.Finished(request.Attempt, Completion.Succeeded(CoreChecks.token 2))) released
+        let drained, after = CoreChecks.step (Action.Drained request.Attempt) finished
+        CoreChecks.same [] (CoreChecks.offers after)
+        CoreChecks.same 0 (Core.pendingAttempts drained)
+
+    [<Test>]
+    member _.``One consumer release preserves a shared checkpoint for the survivor``() =
+        let state, request, handle = SuspensionChecks.initial []
+        let shared = CoreChecks.advance (Action.Demand(CoreChecks.demand 2, CoreChecks.work 1)) state
+        let surviving, effects = CoreChecks.step (Action.Release(CoreChecks.demand 1)) shared
+        CoreChecks.same 0 (CoreChecks.countEffect (EffectAction.Cancel request.Attempt) effects)
+        CoreChecks.same (Some handle) (Core.trySuspension request.Attempt surviving)
+        let resumed = CoreChecks.advance (Action.Resume(handle, CoreChecks.token 1)) surviving
+        let completed, _ = CoreChecks.succeed request 2 resumed
+        CoreChecks.same (CoreChecks.token 2) (CoreChecks.result 1 completed).Value
+
+    [<Test>]
+    member _.``Closing a checkpoint scope waits for cleanup and preserves other scope``() =
+        let state, request, handle = SuspensionChecks.initial []
+        let state = CoreChecks.configure CoreChecks.otherScope 1 [CoreChecks.define 2 1 []] state
+        let state, other = CoreChecks.successful 2 2 state
+        let closing, _ = CoreChecks.step (Action.CloseScope CoreChecks.scope) state
+        CoreChecks.check (not (Core.scopeClosed CoreChecks.scope closing)) "Suspended attempt ownership vanished on close"
+        CoreChecks.check (Core.isEligible other closing) "Unrelated scope was invalidated"
+        CoreChecks.rejects (ProtocolError.InvalidSuspension handle.Id) (Action.Resume(handle, CoreChecks.token 1)) closing
+        let finished = CoreChecks.advance (Action.Finished(request.Attempt, Completion.Cancelled)) closing
+        let closed, effects = CoreChecks.step (Action.Drained request.Attempt) finished
+        CoreChecks.check (Core.scopeClosed CoreChecks.scope closed) "Scope did not close after actual acknowledgement"
+        CoreChecks.same [] (SuspensionChecks.continued effects)
+        CoreChecks.check (Core.isEligible other closed) "Unrelated result lost eligibility during cleanup"
+
+    [<Test>]
+    member _.``Unknown terminal and retired attempts cannot acquire a checkpoint``() =
+        let state, request = CoreChecks.initial [CoreChecks.define 1 1 []] |> CoreChecks.start 1
+        CoreChecks.rejects (ProtocolError.UnknownAttempt(AttemptId 999UL))
+            (Action.Suspend(AttemptId 999UL, StepId 1UL, CoreChecks.token 1)) state
+        let finished = CoreChecks.advance (Action.Finished(request.Attempt, Completion.Succeeded(CoreChecks.token 1))) state
+        CoreChecks.rejects (ProtocolError.AttemptNotCurrent request.Attempt)
+            (Action.Suspend(request.Attempt, StepId 1UL, CoreChecks.token 1)) finished
+        let drained = CoreChecks.advance (Action.Drained request.Attempt) finished
+        CoreChecks.rejects (ProtocolError.AttemptNotCurrent request.Attempt)
+            (Action.Suspend(request.Attempt, StepId 1UL, CoreChecks.token 1)) drained
+        let held, waiting, handle = SuspensionChecks.initial []
+        let retired = CoreChecks.advance Action.Retire held
+        CoreChecks.rejects ProtocolError.RetiredEpoch (Action.Resume(handle, CoreChecks.token 1)) retired
+        let ended =
+            retired
+            |> CoreChecks.advance (Action.Finished(waiting.Attempt, Completion.Cancelled))
+            |> CoreChecks.advance (Action.Drained waiting.Attempt)
+        CoreChecks.check (Core.isDrained ended) "Retired suspended epoch did not drain"

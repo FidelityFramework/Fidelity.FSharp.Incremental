@@ -1,5 +1,56 @@
 # Validation checkpoint — 2026-10-01
 
+## Mailbox and explicit steps — preview.2
+
+The restored Release suite passes **77/77**, zero failures or skips: 49 portable
+core cases, 10 original host cases and 18 mailbox cases. The 46 prior cases remain
+present; 13 suspension and 18 mailbox cases are new. The whole-solution Release
+build passes with zero warnings and errors. SDK 10.0.401 remains the build host.
+This is library validation; neither Composer nor Bozzetto has adopted this API.
+
+The new cases exercise exact one-use resumes, changed declared response inputs,
+reservation acknowledgements, shared demand, bounded command admission, queued
+resume invalidation, logical ownership while suspended, and actual cleanup before
+capacity reuse. A response token does not discover dependencies: the owner still
+supplies complete reads and immutable payloads. Queue burst checks compare accepted
+receipt order and the last accepted input; they do not assert a timing-dependent
+number of queue refusals or establish a fairness guarantee.
+
+One discriminating control deliberately released the physical slot as soon as an
+evaluator returned, before its held cancellation callback finished. The focused
+test **failed as intended** (`Expected 1, got 0`). It first observed the completed
+step's diagnostic and then a FIFO command acknowledgement, so the assertion did
+not depend on an arbitrary delay. Correct source was restored and rebuilt; the
+full 77-case suite passed again. This checks a concrete faulty implementation, not
+every possible scheduler interleaving.
+
+The first full test attempt stopped at two F# indentation errors in test bindings;
+no semantic tests executed. A first mutation selection attempt had an NUnit filter
+syntax error and likewise executed no tests. Both are preserved separately from
+the subsequent executed results. The intentional mutant is absent from this
+checkpoint.
+
+The runnable `MailboxSteps` sample confirms that reservation is acknowledged
+before input mutation, an obsolete suspension cannot invoke its evaluator, the
+fresh response produces value 11, an independent unchanged attempt is retained,
+old eligibility is revoked, and close leaves zero pending attempts. The original
+`SelectiveReuse` sample still reports 30→35, visits 3→2 and retained unchanged work.
+Neither is a compiler integration or throughput measurement.
+
+Raw receipts are external at
+`/home/hhh/.codex/work/incremental-mailbox-2026-10-01/validation/`.
+The final restored test receipt is `release-final.trx`, SHA256
+`45ac8a566ac5e04b0d0e3b3a89e38a1478b4ec71384e266ff069595d2a5bca13`.
+The tested core assembly SHA256 is
+`30c8b9d36fe0451bc1717b46f41053cb0d50c0ab5e94ec3b5aa3a42240a4cbc0`;
+the tested Hosting assembly is
+`0233c70df5dc4db41bd7b416a5e0099b9be44e4d7f5ec2b4ad82d03121c10452`.
+These identify the tested pre-commit build; any subsequent package build has its
+own distribution receipt. See [the auditor checkpoint](Mailbox_Auditor_Checkpoint.md)
+for review scope and consumer acceptance work.
+
+## Original foundation — preview.1
+
 Both the first Debug suite and the final Release suite passed **46/46 tests, with zero failures or skips** on .NET 10. Each contains 36 core tests and 10 host tests. Release testing includes drained-attempt compaction and two strengthened post-drain assertions. The six preceding attempts stopped at source or test-helper compilation errors; they are retained as build evidence and do not count as executed semantic tests.
 
 | Gate | Recorded outcome |

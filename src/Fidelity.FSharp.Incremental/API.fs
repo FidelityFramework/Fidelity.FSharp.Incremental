@@ -13,6 +13,8 @@ namespace Fidelity.FSharp.Incremental
 [<Struct>] type InputStamp = InputStamp of uint64
 [<Struct>] type ValueToken = ValueToken of uint64
 [<Struct>] type EligibilityId = EligibilityId of uint64
+[<Struct>] type StepId = StepId of uint64
+[<Struct>] type SuspensionId = SuspensionId of uint64
 
 [<RequireQualifiedAccess>]
 type ReadSource =
@@ -50,6 +52,25 @@ type StartRequest = {
     Reads: ResolvedRead list
 }
 
+/// A one-use checkpoint. Environment refers only to immutable owner-held data.
+/// Its semantic inputs must be covered by the definition's declared reads/stamps;
+/// the token itself does not register another dependency.
+type SuspensionHandle = {
+    Epoch: EpochId
+    Attempt: AttemptId
+    Id: SuspensionId
+    Step: StepId
+    Environment: ValueToken
+}
+
+/// Response is immutable owner-held data, not a new dependency registration.
+/// Its semantic inputs must also be covered by declared reads/stamps for reuse.
+type ResumeRequest = {
+    Start: StartRequest
+    Suspension: SuspensionHandle
+    Response: ValueToken
+}
+
 type ResultHandle = {
     Epoch: EpochId
     Scope: ScopeId
@@ -78,6 +99,8 @@ type Action =
     | Demand of DemandId * WorkId
     | Release of DemandId
     | Retry of WorkId
+    | Suspend of AttemptId * StepId * ValueToken
+    | Resume of SuspensionHandle * ValueToken
     | Finished of AttemptId * Completion
     | Drained of AttemptId
     | CloseScope of ScopeId
@@ -88,6 +111,8 @@ type Command = { Epoch: EpochId; Action: Action }
 [<RequireQualifiedAccess>]
 type EffectAction =
     | Start of StartRequest
+    | Suspended of SuspensionHandle
+    | Continue of ResumeRequest
     | Cancel of AttemptId
     | Drain of AttemptId
     | Withdraw of ResultHandle
@@ -116,6 +141,10 @@ type ProtocolError =
     | DemandIdReused of DemandId
     | UnknownWork of WorkId
     | UnknownAttempt of AttemptId
+    | AttemptNotCurrent of AttemptId
+    | AlreadySuspended of AttemptId
+    | InvalidSuspension of SuspensionId
+    | SuccessWhileSuspended of AttemptId
     | ConflictingCompletion of AttemptId
     | DrainBeforeCompletion of AttemptId
     | RetryNotFailed of WorkId
@@ -134,6 +163,7 @@ type WorkStatus =
     | Idle
     | Waiting
     | Running of AttemptId
+    | AwaitingResume of SuspensionHandle
     | Draining of AttemptId
     | Eligible of ResultHandle
     | Failed of Failure
@@ -154,6 +184,8 @@ type Snapshot = {
 // Core.step : Command -> Core.State -> Result<Core.State * Effect list, ProtocolError>
 // Core.snapshot : Core.State -> Snapshot
 // Core.tryResult : WorkId -> Core.State -> ResultHandle option
+// Core.trySuspension : AttemptId -> Core.State -> SuspensionHandle option
+// Core.tryActiveRequest : AttemptId -> Core.State -> StartRequest option
 // Core.isEligible : ResultHandle -> Core.State -> bool
 // Core.pendingAttempts : Core.State -> int
 // Core.scopeClosed : ScopeId -> Core.State -> bool

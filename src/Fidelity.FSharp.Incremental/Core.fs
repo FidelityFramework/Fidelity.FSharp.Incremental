@@ -22,6 +22,7 @@ module Core =
     type private Attempt = {
         Request: StartRequest
         Completion: Completion option
+        Suspension: SuspensionHandle option
         Obsolete: bool
         CancelSent: bool
         DrainSent: bool
@@ -32,6 +33,7 @@ module Core =
         Epoch: EpochId
         NextAttempt: uint64
         NextEligibility: uint64
+        NextSuspension: uint64
         Scopes: Map<ScopeId, ScopePhase>
         Works: Map<WorkId, Work>
         Inputs: Map<InputId, InputValue>
@@ -50,6 +52,7 @@ module Core =
         Epoch = epoch
         NextAttempt = 1UL
         NextEligibility = 1UL
+        NextSuspension = 1UL
         Scopes = Map.empty
         Works = Map.empty
         Inputs = Map.empty
@@ -144,6 +147,7 @@ module Core =
             let updated = {
                 attempt with
                     Obsolete = true
+                    Suspension = None
                     CancelSent = attempt.CancelSent || cancel
                     DrainSent = true
             }
@@ -266,6 +270,7 @@ module Core =
                                     }
                                     let attempt = {
                                         Request = request; Completion = None
+                                        Suspension = None
                                         Obsolete = false; CancelSent = false; DrainSent = false
                                     }
                                     let next = {
@@ -395,6 +400,58 @@ module Core =
         let inputs = removed |> Set.fold (fun all id -> Map.remove id all) invalidated.Inputs
         Ok({ invalidated with Inputs = inputs }, effects)
 
+    let private currentAttempt id (state: State) =
+        match Map.tryFind id state.Attempts with
+        | Some attempt when not attempt.Obsolete && Option.isNone attempt.Completion ->
+            match Map.tryFind attempt.Request.Definition.Work state.Works with
+            | Some work when work.Current = Some id
+                             && scopeOpen work.Scope state = Some attempt.Request.Revision
+                             && resolve work state = Some attempt.Request.Reads
+                             && Set.contains work.Definition.Work (demanded state) -> Some attempt
+            | _ -> None
+        | _ -> None
+
+    /// A held checkpoint is visible only while its attempt remains current.
+    let trySuspension id state =
+        currentAttempt id state |> Option.bind (fun attempt -> attempt.Suspension)
+
+    /// Execution admission excludes a waiting checkpoint and any terminal attempt.
+    let tryActiveRequest id state =
+        currentAttempt id state
+        |> Option.bind (fun attempt -> if Option.isNone attempt.Suspension then Some attempt.Request else None)
+
+    let private suspend id step environment (state: State) =
+        match currentAttempt id state with
+        | None when not (Map.containsKey id state.Attempts || Map.containsKey id state.TerminalCompletions) ->
+            Error(ProtocolError.UnknownAttempt id)
+        | None -> Error(ProtocolError.AttemptNotCurrent id)
+        | Some attempt when Option.isSome attempt.Suspension -> Error(ProtocolError.AlreadySuspended id)
+        | Some attempt ->
+            if state.NextSuspension = System.UInt64.MaxValue then Error ProtocolError.IdentifierExhausted
+            else
+                let handle = {
+                    Epoch = state.Epoch; Attempt = id; Id = SuspensionId state.NextSuspension
+                    Step = step; Environment = environment
+                }
+                let next = {
+                    state with
+                        NextSuspension = state.NextSuspension + 1UL
+                        Attempts = Map.add id { attempt with Suspension = Some handle } state.Attempts
+                }
+                Ok(next, [effect next (EffectAction.Suspended handle)])
+
+    let private resume (handle: SuspensionHandle) response (state: State) =
+        if handle.Epoch <> state.Epoch then Error ProtocolError.ForeignEpoch
+        else
+            match currentAttempt handle.Attempt state with
+            | Some attempt when attempt.Suspension = Some handle ->
+                let next = {
+                    state with Attempts = Map.add handle.Attempt { attempt with Suspension = None } state.Attempts
+                }
+                let request = { Start = attempt.Request; Suspension = handle; Response = response }
+                Ok(next, [effect next (EffectAction.Continue request)])
+            | _ -> Error(ProtocolError.InvalidSuspension handle.Id)
+
     let private finish id completion (state: State) =
         match Map.tryFind id state.Attempts with
         | None ->
@@ -406,8 +463,10 @@ module Core =
             match attempt.Completion with
             | Some previous when previous = completion -> Ok(state, [])
             | Some _ -> Error(ProtocolError.ConflictingCompletion id)
+            | None when Option.isSome attempt.Suspension && (match completion with Completion.Succeeded _ -> true | _ -> false) ->
+                Error(ProtocolError.SuccessWhileSuspended id)
             | None ->
-                let updated = { attempt with Completion = Some completion; DrainSent = true }
+                let updated = { attempt with Completion = Some completion; Suspension = None; DrainSent = true }
                 let effects = if attempt.DrainSent then [] else [effect state (EffectAction.Drain id)]
                 Ok({ state with Attempts = Map.add id updated state.Attempts }, effects)
 
@@ -501,6 +560,8 @@ module Core =
             | Some work when Option.isSome work.Failure || work.Cancelled ->
                 Ok({ state with Works = Map.add id { work with Failure = None; Cancelled = false } state.Works }, [])
             | Some _ -> Error(ProtocolError.RetryNotFailed id)
+        | Action.Suspend(id, step, environment) -> suspend id step environment state
+        | Action.Resume(handle, response) -> resume handle response state
         | Action.Finished(id, completion) -> finish id completion state
         | Action.Drained id -> drain id state
         | Action.CloseScope scope -> close scope state
@@ -541,8 +602,10 @@ module Core =
                 | Some value, _, _, _ -> WorkStatus.Eligible value
                 | _, Some attemptId, _, _ ->
                     let attempt = Map.find attemptId state.Attempts
-                    if Option.isSome attempt.Completion then WorkStatus.Draining attemptId
-                    else WorkStatus.Running attemptId
+                    match attempt.Suspension with
+                    | Some handle -> WorkStatus.AwaitingResume handle
+                    | None when Option.isSome attempt.Completion -> WorkStatus.Draining attemptId
+                    | None -> WorkStatus.Running attemptId
                 | _, _, Some failure, _ -> WorkStatus.Failed failure
                 | _, _, _, true -> WorkStatus.Cancelled
                 | _ ->

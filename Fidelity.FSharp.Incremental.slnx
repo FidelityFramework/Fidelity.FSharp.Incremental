@@ -3,4 +3,5 @@
   <Project Path="src/Fidelity.FSharp.Incremental.Hosting/Fidelity.FSharp.Incremental.Hosting.fsproj" />
   <Project Path="tests/Fidelity.FSharp.Incremental.Tests/Fidelity.FSharp.Incremental.Tests.fsproj" />
   <Project Path="samples/SelectiveReuse/SelectiveReuse.fsproj" />
+  <Project Path="samples/MailboxSteps/MailboxSteps.fsproj" />
 </Solution>

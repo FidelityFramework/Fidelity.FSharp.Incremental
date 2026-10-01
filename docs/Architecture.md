@@ -4,6 +4,8 @@ The first implementation separates a deterministic command processor from execut
 
 The core has no tasks, cancellation tokens, filesystem operations, clocks, ambient transactions, user callbacks, or generic payload equality. The host stores immutable payloads behind `ValueToken`. Commands and effects carry an `EpochId`. A caller serializes commands, commits the returned state, then interprets the ordered effects. Rejected commands return neither a replacement state nor effects. This leaves a small protocol to port to a future host without importing CLR task semantics into Clef.
 
+The authored [steps and mailbox extension](Steps_and_Mailboxes.md) retains logical attempts across resource-free suspension and adds a FIFO coordinator with acknowledged reservation. Its [auditor checkpoint](Mailbox_Auditor_Checkpoint.md) remains a separate validation gate. Environment/response tokens carry immutable owner data; they do not discover dependencies or replace complete declared reads and stamps.
+
 ## Identity and complete dependencies
 
 `ScopeId` identifies an independently closable owner. A `RevisionId` identifies its reserved or open definition set. `WorkId` is stable lookup identity; `DefinitionStamp` distinguishes definitions of that work. Input identity, input stamp, and value token are separate. The library does not interpret these tokens or prove that their owner issued them correctly.

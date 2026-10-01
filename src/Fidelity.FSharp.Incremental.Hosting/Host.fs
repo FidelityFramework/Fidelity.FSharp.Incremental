@@ -130,10 +130,12 @@ type Host(epoch: EpochId, maxConcurrency: int, evaluator: Evaluator) =
     }
 
     /// Applies a command atomically. Reservation withdraws eligibility before returning.
-    /// Finished and Drained belong to this host and cannot be supplied by its caller.
+    /// Step suspension/resumption requires MailboxHost. Lifecycle acknowledgements
+    /// belong to the host and cannot be supplied by its caller.
     member _.Send(action: Action) =
         match action with
-        | Action.Finished _ | Action.Drained _ -> invalidArg (nameof action) "The host owns completion and drain acknowledgements."
+        | Action.Finished _ | Action.Drained _ | Action.Suspend _ | Action.Resume _ ->
+            invalidArg (nameof action) "The host owns lifecycle acknowledgements; use MailboxHost for explicit steps."
         | _ -> ()
         let result = lock gate (fun () ->
             match protocolFault with

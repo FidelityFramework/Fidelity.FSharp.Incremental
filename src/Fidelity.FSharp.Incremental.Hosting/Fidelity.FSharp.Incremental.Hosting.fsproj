@@ -6,5 +6,6 @@
   <ItemGroup>
     <ProjectReference Include="../Fidelity.FSharp.Incremental/Fidelity.FSharp.Incremental.fsproj" />
     <Compile Include="Host.fs" />
+    <Compile Include="MailboxHost.fs" />
   </ItemGroup>
 </Project>

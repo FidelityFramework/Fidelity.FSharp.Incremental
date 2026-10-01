@@ -229,8 +229,11 @@ type HostTests() =
     }
 
     [<Test>]
-    member _.``caller cannot forge host completion or drain``() = task {
+    member _.``caller cannot forge lifecycle events or step the non-step host``() = task {
         use host = new Host(epoch, 1, fun _ _ -> Task.FromResult(ValueToken 1UL))
         Assert.Throws<ArgumentException>(fun () -> host.Send(Action.Finished(AttemptId 1UL, Completion.Succeeded(ValueToken 1UL))) |> ignore) |> ignore
         Assert.Throws<ArgumentException>(fun () -> host.Send(Action.Drained(AttemptId 1UL)) |> ignore) |> ignore
+        Assert.Throws<ArgumentException>(fun () -> host.Send(Action.Suspend(AttemptId 1UL, StepId 1UL, ValueToken 1UL)) |> ignore) |> ignore
+        let handle = { Epoch = epoch; Attempt = AttemptId 1UL; Id = SuspensionId 1UL; Step = StepId 1UL; Environment = ValueToken 1UL }
+        Assert.Throws<ArgumentException>(fun () -> host.Send(Action.Resume(handle, ValueToken 1UL)) |> ignore) |> ignore
     }
