@@ -25,7 +25,8 @@ this additive observer and the actual consumer integrations need their own
 review. This is not compiler/native-host acceptance.
 
 The consumer packages were packed from implementation commit
-`87c77d91ab24c8e4d065e4e726f8c06abc3180c4`; both nuspecs record that full source pin.
+`87c77d91ab24c8e4d065e4e726f8c06abc3180c4`; Core's nuspec records the full pin,
+while Hosting's records its abbreviation `87c77d9`.
 Exact preview.5 archive SHA256 values:
 
 - Core: `7f27688e98c2cee965b6ebf5f20073fb9d17b3f9d89e12511daf5e5a4eca3a88`.
