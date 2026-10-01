@@ -1,5 +1,9 @@
 # Mailbox and continuation auditor checkpoint
 
+The independent [assessment](Mailbox_Auditor_Assessment_2026-10-01.md) and the
+subsequent [F1 repair response](Mailbox_Audit_Response_2026-10-01.md) are now
+available. The remainder of this page preserves the original review checkpoint.
+
 Status: ready for independent audit of the mailbox/step tranche, with a restored Release suite passing 77/77 tests. The preceding commit `affb92d206242a21fc2032d51016cd0f29e7e54f` is the historical 46-test baseline. The Bozzetto peer is the intended auditor; no deployment or consumer adoption follows merely from this document.
 
 Implementation and package source pin:

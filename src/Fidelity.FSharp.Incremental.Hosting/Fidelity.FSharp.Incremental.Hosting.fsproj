@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Fidelity.FSharp.Incremental/Fidelity.FSharp.Incremental.fsproj" />
+    <Compile Include="AssemblyInfo.fs" />
     <Compile Include="Host.fs" />
     <Compile Include="MailboxHost.fs" />
   </ItemGroup>

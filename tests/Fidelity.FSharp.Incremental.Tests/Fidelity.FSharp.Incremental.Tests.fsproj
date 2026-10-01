@@ -11,6 +11,7 @@
     <ProjectReference Include="../../src/Fidelity.FSharp.Incremental.Hosting/Fidelity.FSharp.Incremental.Hosting.fsproj" />
     <Compile Include="CoreTests.fs" />
     <Compile Include="HostTests.fs" />
+    <Compile Include="HostFaultTests.fs" />
     <Compile Include="MailboxTests.fs" />
   </ItemGroup>
 </Project>

@@ -55,7 +55,23 @@ must never launch. Also test the opposite ordering, where launch legitimately
 wins reservation. These are consumer integration gates, not established by this
 library's task-lifecycle tests.
 
-Token cancellation callbacks run outside the coordinator and are joined before normal draining and capacity reuse. Ordinary evaluator exceptions become failed completions. An internal host/core protocol fault makes `Send` and `WaitForIdleAsync` fail explicitly; it is not a successful idle result or cleanup certificate. These failure paths require dedicated tests before integration.
+Token cancellation callbacks run outside the coordinator and are joined before
+draining and capacity reuse. Ordinary evaluator exceptions become failed
+completions and callback failures remain diagnostics; neither alone faults the
+host protocol. The original `Host` now also records evaluator failures as
+diagnostics.
+
+An internal host/core disagreement stops new admission and cancels remaining
+owned work. Physical completion remains separate from graph acknowledgements.
+`Send` fails immediately and result queries fail closed; `WaitForIdleAsync` and
+`CloseAsync` join evaluators and cancellation callbacks before reporting an
+`AggregateException` containing the protocol error and failures from work owned
+at or after that fault. An observer may still cancel its own idle wait. Close
+shares one stable task, even if the core refuses `Retire`, and rejects further
+commands once shutdown starts. No new `Finished` or `Drained` certificates are
+manufactured after disagreement, so a faulted graph's pending count can remain
+nonzero after physical cleanup. See the [audit response](Mailbox_Audit_Response_2026-10-01.md)
+for the fault-injection controls and remaining consumer gates.
 
 ## Retirement and integration boundaries
 

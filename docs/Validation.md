@@ -1,5 +1,25 @@
 # Validation checkpoint — 2026-10-01
 
+## Faulted host cleanup — preview.3
+
+The [independent assessment](Mailbox_Auditor_Assessment_2026-10-01.md) found that
+the original `Host.CloseAsync` could report an internal protocol fault before
+owned evaluation and cancellation callbacks joined. The repair separates physical
+completion from graph acknowledgement, cancels all owned work on disagreement,
+and reports the aggregate error only after joining. The core and `MailboxHost`
+source are unchanged.
+
+Seven focused cases now cover `Finished` and `Drained` rejection with both cleanup
+orders, rejected retirement, automatic cancellation before close, and uninjected
+shutdown. The initial four-case red run executed three failures and one passing
+control against the old implementation. The final full Release suite passes
+**84/84**, zero failures or skips. Receipt `release-final.trx` has SHA256
+`c085da659334e176d8593127668307c8ed10ecab5608e92010169689d65f7286`.
+Logs and source/binary hashes are external at
+`/home/hhh/.codex/work/incremental-host-fault-2026-10-01/`.
+See the [repair response](Mailbox_Audit_Response_2026-10-01.md) for the precise
+changes, reproduction and consumer adoption conditions.
+
 ## Mailbox and explicit steps — preview.2
 
 The restored Release suite passes **77/77**, zero failures or skips: 49 portable
