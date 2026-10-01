@@ -6,7 +6,12 @@
   <ItemGroup>
     <ProjectReference Include="../Fidelity.FSharp.Incremental/Fidelity.FSharp.Incremental.fsproj" />
     <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="Contracts.fs" />
+    <Compile Include="AsyncCell.fs" />
+    <Compile Include="Execution.fs" />
     <Compile Include="Host.fs" />
+    <Compile Include="AsyncMailbox.fs" />
+    <Compile Include="ClrInterop.fs" />
     <Compile Include="MailboxHost.fs" />
   </ItemGroup>
 </Project>

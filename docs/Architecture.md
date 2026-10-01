@@ -34,7 +34,31 @@ Execution ownership begins when the core emits `Start`, even if the host has not
 
 The host must convert synchronous start failures and asynchronous exceptions into terminal outcomes, perform cleanup, and report draining without stranding ownership. Cancellation of an individual wait must remain separate from cancellation of shared work. Callbacks and cleanup run outside core state transitions; exceptions cannot partially commit the state machine. An `Offer` is bookkeeping eligibility, not an external publication instruction.
 
-## .NET host surface
+## Functional workflow surface
+
+`AsyncMailbox` is the preferred hosted surface: typed module operations and an
+evaluator `StepInvocation -> WorkCancellation -> Async<StepOutcome>`. Creation is
+cold, coordinator start is explicit, and bounded command admission returns a
+retained operation handle. Observing that handle is cold and repeatable; an
+observer's cancellation cannot retract admission or cancel shared work. Await a
+successful reservation receipt before mutation. `beginClose` seals admission
+immediately; the convenience `close` workflow does so only when executed.
+
+The implementation is an F# async coordinator and typed continuation cells, not
+an Async wrapper around a Task engine. Owned workflows receive an explicit stop
+request and run without ambient attempt cancellation, preserving joins and cleanup
+errors. CLR callbacks run outside the coordinator and join separately. Physical
+ownership and faulted graph state remain distinct. The functional close outcome is
+`Result<unit, Failure>`; additional evaluator/callback failures remain diagnostics.
+
+`ClrInterop` supplies Task factories, observer conversion and cancellation tokens
+for necessary .NET I/O. `MailboxHost` is a compatibility adapter over the same
+engine, retaining eager construction and immediate method-invocation admission.
+The older `Host` below remains a separate legacy API. See the
+[functional checkpoint](Functional_Async_Checkpoint_2026-10-01.md) for timing,
+reconciliation, lifetime controls and the current native-port boundary.
+
+## Legacy .NET host surface
 
 `Host(epoch, maxConcurrency, evaluator)` coordinates the core and bounds admitted evaluator lifetimes with a semaphore. The evaluator has type `StartRequest -> CancellationToken -> Task<ValueToken>` and must create fresh work for each invocation. Its returned task must include every owned child operation and resource cleanup. The host cannot discover a task the evaluator abandons, and cannot forcibly interrupt synchronous code or a child process that ignores cancellation.
 

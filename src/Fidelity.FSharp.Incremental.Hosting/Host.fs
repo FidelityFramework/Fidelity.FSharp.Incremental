@@ -9,8 +9,6 @@ open Fidelity.FSharp.Incremental
 /// A fresh invocation for each attempt. Completion must include all owned cleanup.
 type Evaluator = StartRequest -> CancellationToken -> Task<ValueToken>
 
-type HostDiagnostic = { Attempt: AttemptId; Failure: Failure }
-
 type private Running(request: StartRequest) =
     member _.Request = request
     member val Source = new CancellationTokenSource()

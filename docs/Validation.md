@@ -1,5 +1,28 @@
 # Validation checkpoint — 2026-10-01
 
+## Functional async host — preview.4
+
+The final restored Release suite passes **99/99**, zero failures/skips. The
+preceding 84 cases remain; 15 new cases cover explicit startup/admission,
+exact-operation reconciliation, observer cancellation, physical joins, explicit
+stop requests, cleanup exceptions, suspension authority and a bounded exact Core
+trace. `MailboxHost` now delegates to this Async engine, so its existing 18 cases
+exercise the new implementation through the compatibility boundary. The older
+`Host` repair remains unchanged apart from relocating a shared diagnostic type.
+
+The full solution builds without warnings/errors. All three samples pass.
+Eight isolated FSharp.Core lifetime controls pass separately. A deliberately
+early-returning faulted-idle mutant fails its intended join assertion; after
+restoration and rebuild, all 99 repository tests pass. The initial test-helper
+compilation and mutant-filter errors executed no tests and are recorded separately.
+
+The [functional checkpoint](Functional_Async_Checkpoint_2026-10-01.md) records the
+API timing, evidence, SHA256 receipts and remaining adoption conditions. Final TRX:
+`6f16a90cd9d06d5a2b6c0043f234c455fe6cd8a8cd24fd0824f9b567001cd05b`.
+Evidence is external at
+`/home/hhh/.codex/work/incremental-functional-2026-10-01/`.
+Neither Bozzetto/Composer integration nor native-host equivalence is established.
+
 ## Faulted host cleanup — preview.3
 
 The [independent assessment](Mailbox_Auditor_Assessment_2026-10-01.md) found that
