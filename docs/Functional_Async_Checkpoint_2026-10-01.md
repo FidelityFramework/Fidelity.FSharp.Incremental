@@ -82,6 +82,25 @@ FSharp.Core also identified coordinator wait-handle disposal, now performed befo
 close publication. The eight isolated Async controls are recorded separately in
 `async-lifetime/probe.log`; they are not included in the 99 repository cases.
 
+## Committed distribution receipt
+
+Implementation pin: `d3239c26cf4de5e06babd541f576d9466e7a1986`.
+Both local `0.1.0-preview.4` packages were built from that committed source and
+carry its exact repository pin. A separate console project with only the Hosting
+package reference restored, built and ran the complete `AsyncDocuments` sample.
+Its dependency closure contains only core, Hosting and FSharp.Core 10.1.401; it
+has no project reference. This checks distribution shape and the exercised API,
+not package-feed publication or integration into a compiler workspace.
+
+| Archive | SHA256 |
+| --- | --- |
+| Core | `25054798c3d46f6df0babafcb468403432a9e41970e9b04d3d079b1af537c6fb` |
+| Hosting | `8f963aa925a4e54645797c2eb7139dffd6821913c8f53f6bc39093ac0ce29c86` |
+
+Package archives, manifests and the isolated consumer remain in the external
+validation directory. The shared Bozzetto build lease was released. No compiler
+distribution, service, model configuration or consumer dependency was changed.
+
 Review the distinction between admission and acknowledgement, exact-operation re-observation, observer versus owner cancellation, physical joins after faults, typed payloads, and the CLR boundary. The independent original assessment and follow-up are preserved unchanged.
 
 The original consumer conditions remain: one mutation owner, control admission under saturation, authority checked atomically at actual external launch/commit, total logical-work and payload budgets, one event-drain owner with fan-out, and real-process cleanup. This tranche does not establish compiler proof eligibility or native artifact authority, nor provide actor supervision, remote transport or general delimited continuations.
