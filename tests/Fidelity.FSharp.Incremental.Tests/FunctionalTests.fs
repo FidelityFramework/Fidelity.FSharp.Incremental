@@ -80,6 +80,57 @@ open FunctionalChecks
 [<TestFixture>]
 type FunctionalTests() =
     [<Test>]
+    member _.``watch retains a change before observation starts without consuming events``() = task {
+        let handle = create (fun _ _ -> async { return succeeded 1UL })
+        start handle
+        do! healthy handle noRelease (fun () -> task {
+            let before, changed = AsyncMailbox.watch handle
+            same [] before.Graph.Scopes
+            do! register handle [define work]
+            do! send handle (Action.Demand(DemandId 1UL, work))
+            do! idle handle
+            do! changed |> run |> wait
+            do! changed |> run |> wait
+            same (ValueToken 1UL) (result handle).Value
+            check (not (List.isEmpty (AsyncMailbox.drainEvents handle))) "Watching must not consume the owner's events."
+        })
+    }
+
+    [<Test>]
+    member _.``watch cancellation detaches one observer without losing another``() = task {
+        let handle = create (fun _ _ -> async { return succeeded 1UL })
+        start handle
+        do! healthy handle noRelease (fun () -> task {
+            let _, changed = AsyncMailbox.watch handle
+            use observer = new CancellationTokenSource()
+            let detached = Async.StartAsTask(changed, cancellationToken = observer.Token)
+            let retained = run changed
+            observer.Cancel()
+            do! cancelled detached
+            check (not retained.IsCompleted) "Canceling one observer must not wake another."
+            do! send handle (Action.ReserveScope(scope, RevisionId 1UL))
+            do! wait retained
+            same false (AsyncMailbox.snapshot handle).IsClosing
+        })
+    }
+
+    [<Test>]
+    member _.``watch on a cold mailbox starts no work and sees close``() = task {
+        let mutable calls = 0
+        let handle = create (fun _ _ -> async { Interlocked.Increment(&calls) |> ignore; return succeeded 1UL })
+        let before, changed = AsyncMailbox.watch handle
+        same [] before.Graph.Works
+        same 0 calls
+        let closing = AsyncMailbox.beginClose handle
+        do! changed |> run |> wait
+        let after, _ = AsyncMailbox.watch handle
+        check after.IsClosing "A late observer must be directed to the retained physical join."
+        let! outcome = AsyncMailbox.awaitClose closing |> run |> wait
+        same (Ok ()) outcome
+        same 0 calls
+    }
+
+    [<Test>]
     member _.``creation is cold and explicit start does not demand work``() = task {
         let mutable calls = 0
         let evaluator _ _ = async {

@@ -433,19 +433,32 @@ module AsyncMailbox =
             return! waitForIdle handle
     }
 
+    let private readSnapshot runtime =
+        let graph = Core.snapshot runtime.Published
+        {
+            Graph = graph
+            QueuedCommands = runtime.QueuedCommands
+            QueuedSteps = runtime.QueuedSteps
+            RunningSteps = runtime.PublishedRunning
+            Suspensions = graph.Works |> List.choose (fun work ->
+                match work.Status with WorkStatus.AwaitingResume suspension -> Some suspension | _ -> None)
+            IsClosing = runtime.Closing
+        }
+
     let snapshot handle =
         let runtime = handle.Runtime
-        lock runtime.Gate (fun () ->
-            let graph = Core.snapshot runtime.Published
-            {
-                Graph = graph
-                QueuedCommands = runtime.QueuedCommands
-                QueuedSteps = runtime.QueuedSteps
-                RunningSteps = runtime.PublishedRunning
-                Suspensions = graph.Works |> List.choose (fun work ->
-                    match work.Status with WorkStatus.AwaitingResume suspension -> Some suspension | _ -> None)
-                IsClosing = runtime.Closing
-            })
+        lock runtime.Gate (fun () -> readSnapshot runtime)
+
+    /// Capture the published state and its next change notification together.
+    /// A change before observation starts is retained, avoiding a lost wakeup.
+    /// The cold notification is repeatable; cancelling it detaches only that
+    /// observer. It neither admits work nor consumes events. Recheck the owned
+    /// condition after every wakeup; a wakeup is not result or effect authority.
+    /// When IsClosing is true, observe beginClose/awaitClose instead: there may
+    /// be no further state change after the physical close has completed.
+    let watch handle =
+        let runtime = handle.Runtime
+        lock runtime.Gate (fun () -> readSnapshot runtime, AsyncCell.observe runtime.Changed)
 
     let tryResult work handle =
         let runtime = handle.Runtime
