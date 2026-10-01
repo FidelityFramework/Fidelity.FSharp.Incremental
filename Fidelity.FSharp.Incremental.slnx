@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/Fidelity.FSharp.Incremental/Fidelity.FSharp.Incremental.fsproj" />
+  <Project Path="src/Fidelity.FSharp.Incremental.Hosting/Fidelity.FSharp.Incremental.Hosting.fsproj" />
+  <Project Path="tests/Fidelity.FSharp.Incremental.Tests/Fidelity.FSharp.Incremental.Tests.fsproj" />
+  <Project Path="samples/SelectiveReuse/SelectiveReuse.fsproj" />
+</Solution>

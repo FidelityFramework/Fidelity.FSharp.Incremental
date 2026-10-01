@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Explicit dependency, demand and attempt lifecycle for incremental computation.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="API.fs" />
+    <Compile Include="Core.fs" />
+  </ItemGroup>
+</Project>

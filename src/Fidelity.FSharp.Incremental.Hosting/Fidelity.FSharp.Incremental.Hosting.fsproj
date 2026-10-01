@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Bounded .NET execution host for Fidelity.FSharp.Incremental.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Fidelity.FSharp.Incremental/Fidelity.FSharp.Incremental.fsproj" />
+    <Compile Include="Host.fs" />
+  </ItemGroup>
+</Project>
