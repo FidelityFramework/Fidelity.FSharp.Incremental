@@ -14,5 +14,6 @@
     <Compile Include="HostFaultTests.fs" />
     <Compile Include="MailboxTests.fs" />
     <Compile Include="FunctionalTests.fs" />
+    <Compile Include="ClrInteropTests.fs" />
   </ItemGroup>
 </Project>

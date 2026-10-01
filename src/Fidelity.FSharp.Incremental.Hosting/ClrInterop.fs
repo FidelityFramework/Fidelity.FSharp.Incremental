@@ -11,13 +11,10 @@ module ClrInterop =
     /// request belongs to the attempt, never to a reply/close observer.
     let cancellationToken cancellation = ExecutionBoundary.token cancellation
 
-    /// Invoke a cold Task factory and attach its completion in one continuation
-    /// boundary. Once invoked, the wait cannot detach before that Task finishes.
-    /// The factory's Task must itself include its owned children and cleanup.
-    let fromTask (factory: CancellationToken -> Task<'T>) cancellation : Async<'T> =
+    let private invokeAndJoin (factory: unit -> Task<'T>) : Async<'T> =
         Async.FromContinuations(fun (success, error, _) ->
             let pending =
-                try Ok(factory (cancellationToken cancellation))
+                try Ok(factory ())
                 with failure -> Error failure
             match pending with
             | Error failure -> error failure
@@ -34,6 +31,21 @@ module ClrInterop =
                     CancellationToken.None,
                     TaskContinuationOptions.ExecuteSynchronously,
                     TaskScheduler.Default) |> ignore)
+
+    /// Invoke a cold Task factory and attach its completion in one continuation
+    /// boundary. Once invoked, the wait cannot detach before that Task finishes.
+    /// The factory's Task must itself include its owned children and cleanup.
+    let fromTask (factory: CancellationToken -> Task<'T>) cancellation : Async<'T> =
+        invokeAndJoin (fun () -> factory (cancellationToken cancellation))
+
+    /// For a CLR owner outside a mailbox attempt. Run this cold workflow with
+    /// ambient CancellationToken.None; cancel separate observers, not its owner.
+    /// Once invoked, it joins the exact returned Task, which must include all
+    /// owned children and cleanup. Faults retain their original exception;
+    /// canceled Tasks report OperationCanceledException through the error path
+    /// so an owned workflow can finish cleanup without Async cancellation.
+    let fromUncancelledTask (factory: unit -> Task<'T>) : Async<'T> =
+        invokeAndJoin factory
 
     /// Starts an observer workflow for a CLR consumer. The supplied token
     /// cancels that observer; it is not the owned attempt's cancellation request.
