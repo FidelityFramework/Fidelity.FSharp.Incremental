@@ -23,3 +23,14 @@ The [independent preview.4 assessment](Functional_Async_Auditor_Assessment_2026-
 and its original checkpoint are unchanged. Its acceptance covers preview.4;
 this additive observer and the actual consumer integrations need their own
 review. This is not compiler/native-host acceptance.
+
+The consumer packages were packed from implementation commit
+`87c77d91ab24c8e4d065e4e726f8c06abc3180c4`; both nuspecs record that full source pin.
+Exact preview.5 archive SHA256 values:
+
+- Core: `7f27688e98c2cee965b6ebf5f20073fb9d17b3f9d89e12511daf5e5a4eca3a88`.
+- Hosting: `fb63ca9b638dde967958c032cce13e685dd78baf6b1e67766a764b00afa8e5e3`.
+
+Identical copies are retained in the consumers' explicit vendored NuGet feeds.
+This records dependency provenance; consumer builds, native behavior and
+distribution promotion have separate acceptance receipts.
