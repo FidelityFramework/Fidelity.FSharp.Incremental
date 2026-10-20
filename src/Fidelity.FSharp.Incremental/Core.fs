@@ -3,6 +3,10 @@ namespace Fidelity.FSharp.Incremental
 /// Deterministic ownership and scheduling. Payloads and execution stay with the host.
 [<RequireQualifiedAccess>]
 module Core =
+    // Keep counter bounds in the portable language core, without a CLR numeric API.
+    [<Literal>]
+    let private identifierLimit = 0xffff_ffff_ffff_ffffUL
+
     type private Cached = {
         Attempt: AttemptId
         Value: ValueToken
@@ -247,7 +251,7 @@ module Core =
                         else
                             match work.Cached with
                             | Some cached when cached.Reads = reads ->
-                                if current.NextEligibility = System.UInt64.MaxValue then Error ProtocolError.IdentifierExhausted
+                                if current.NextEligibility = identifierLimit then Error ProtocolError.IdentifierExhausted
                                 else
                                     let handle = {
                                         Epoch = current.Epoch; Scope = work.Scope; Revision = revision; Work = id
@@ -261,7 +265,7 @@ module Core =
                                     }
                                     schedule next (output @ [effect next (EffectAction.Offer handle)]) rest
                             | _ when Set.contains id demand && Option.isNone work.Failure && not work.Cancelled ->
-                                if current.NextAttempt = System.UInt64.MaxValue then Error ProtocolError.IdentifierExhausted
+                                if current.NextAttempt = identifierLimit then Error ProtocolError.IdentifierExhausted
                                 else
                                     let attemptId = AttemptId current.NextAttempt
                                     let request = {
@@ -427,7 +431,7 @@ module Core =
         | None -> Error(ProtocolError.AttemptNotCurrent id)
         | Some attempt when Option.isSome attempt.Suspension -> Error(ProtocolError.AlreadySuspended id)
         | Some attempt ->
-            if state.NextSuspension = System.UInt64.MaxValue then Error ProtocolError.IdentifierExhausted
+            if state.NextSuspension = identifierLimit then Error ProtocolError.IdentifierExhausted
             else
                 let handle = {
                     Epoch = state.Epoch; Attempt = id; Id = SuspensionId state.NextSuspension

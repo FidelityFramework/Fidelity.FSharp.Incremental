@@ -2,4 +2,5 @@
 **/obj/
 **/TestResults/
 artifacts/
+.scratch/
 .vs/
