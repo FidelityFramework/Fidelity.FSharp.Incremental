@@ -18,6 +18,19 @@ type private Running(request: StartRequest) =
     member val CancelRequested = false with get, set
     member val Cancellation: Task option = None with get, set
 
+[<NoEquality; NoComparison>]
+type private DemandWaiter = {
+    Work: WorkId
+    Resolve: Choice<Result<ResultHandle, HostDemandError>, exn> -> unit
+    mutable Node: LinkedListNode<DemandWaiter> option
+}
+
+[<RequireQualifiedAccess>]
+type private DemandCheck =
+    | Pending
+    | Ready of Result<ResultHandle, HostDemandError>
+    | Faulted of exn
+
 /// Serializes the portable protocol and bounds actual evaluator ownership.
 /// Observer cancellation only detaches the observer; Release removes demand.
 type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
@@ -27,6 +40,7 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
     let gate = obj ()
     let slots = new SemaphoreSlim(maxConcurrency, maxConcurrency)
     let running = Dictionary<AttemptId, Running>()
+    let demandWaiters = LinkedList<DemandWaiter>()
     let events = Queue<Effect>()
     let diagnostics = Queue<HostDiagnostic>()
     let mutable state = Core.init epoch
@@ -35,6 +49,50 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
     let shutdownErrors = ResizeArray<exn>()
 
     let failure code (error: exn) = { Code = code; Message = error.Message }
+
+    let inspectDemand (work: WorkId) =
+        match protocolFault with
+        | Some error -> DemandCheck.Faulted(InvalidOperationException("Host protocol is faulted.", error))
+        | None ->
+            match Core.tryResult work state with
+            | Some handle when Core.isEligible handle state -> DemandCheck.Ready(Ok handle)
+            | _ when closing.IsSome -> DemandCheck.Ready(Error HostDemandError.Closed)
+            | _ ->
+                match (Core.snapshot state).Works |> List.tryFind (fun item -> item.Work = work) with
+                | None -> DemandCheck.Ready(Error HostDemandError.WorkUnavailable)
+                | Some { Status = WorkStatus.Eligible handle } when Core.isEligible handle state ->
+                    DemandCheck.Ready(Ok handle)
+                | Some { Status = WorkStatus.Failed detail } ->
+                    DemandCheck.Ready(Error(HostDemandError.WorkFailed detail))
+                | Some { Status = WorkStatus.Cancelled } ->
+                    DemandCheck.Ready(Error HostDemandError.WorkCancelled)
+                | Some _ -> DemandCheck.Pending
+
+    let collectReadyWaiters () =
+        if demandWaiters.Count = 0 then
+            Array.empty
+        else
+            let ready = ResizeArray<DemandWaiter * Choice<Result<ResultHandle, HostDemandError>, exn>>()
+            let mutable node = demandWaiters.First
+            while not (isNull node) do
+                let next = node.Next
+                let waiter = node.Value
+                match inspectDemand waiter.Work with
+                | DemandCheck.Pending -> ()
+                | DemandCheck.Ready outcome ->
+                    demandWaiters.Remove node
+                    waiter.Node <- None
+                    ready.Add(waiter, Choice1Of2 outcome)
+                | DemandCheck.Faulted error ->
+                    demandWaiters.Remove node
+                    waiter.Node <- None
+                    ready.Add(waiter, Choice2Of2 error)
+                node <- next
+            ready.ToArray()
+
+    let notifyWaiters (ready: (DemandWaiter * Choice<Result<ResultHandle, HostDemandError>, exn>)[]) =
+        for waiter, outcome in ready do
+            waiter.Resolve outcome
 
     // All bookkeeping below is under gate. User callbacks run outside it.
     let recordFailure (entry: Running) code error =
@@ -120,16 +178,21 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
             outcome <- Completion.Failed (failure "evaluation" error)
             lock gate (fun () -> recordFailure entry "evaluation" error)
 
-        lock gate (fun () -> lifecycle (Some entry) (Action.Finished(entry.Request.Attempt, outcome))) |> launch
+        let finishedStarts, finishedReady =
+            lock gate (fun () ->
+                let starts = lifecycle (Some entry) (Action.Finished(entry.Request.Attempt, outcome))
+                starts, collectReadyWaiters ())
+        launch finishedStarts
+        notifyWaiters finishedReady
 
         // Even a rejected acknowledgement leaves physical ownership intact.
         // Cancellation callbacks can reenter the host, so await outside gate.
         let mutable drained = false
         while not drained do
-            let waitFor, starts =
+            let waitFor, starts, ready =
                 lock gate (fun () ->
                     match entry.Cancellation with
-                    | Some work when not work.IsCompleted -> Some work, []
+                    | Some work when not work.IsCompleted -> Some work, [], Array.empty
                     | _ ->
                         entry.Source.Dispose()
                         if acquired then
@@ -139,10 +202,12 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
                         // cancellation against this already-disposed source.
                         running.Remove entry.Request.Attempt |> ignore
                         let starts = lifecycle (Some entry) (Action.Drained entry.Request.Attempt)
+                        let ready = collectReadyWaiters ()
                         entry.Done.TrySetResult() |> ignore
                         drained <- true
-                        None, starts)
+                        None, starts, ready)
             launch starts
+            notifyWaiters ready
             match waitFor with
             | Some work -> do! work
             | None -> ()
@@ -173,18 +238,126 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
         | Action.Finished _ | Action.Drained _ | Action.Suspend _ | Action.Resume _ ->
             invalidArg (nameof action) "The host owns lifecycle acknowledgements; use MailboxHost for explicit steps."
         | _ -> ()
-        let result = lock gate (fun () ->
+        let result, ready, faultToRaise = lock gate (fun () ->
             match protocolFault with
-            | Some error -> raise (InvalidOperationException("Host protocol is faulted.", error))
-            | None when closing.IsSome -> invalidOp "Host is closing."
+            | Some error -> Error ProtocolError.ForeignEpoch, Array.empty, Some(InvalidOperationException("Host protocol is faulted.", error))
+            | None when closing.IsSome -> Error ProtocolError.RetiredEpoch, Array.empty, Some(InvalidOperationException("Host is closing."))
             | None ->
-                try transition action
+                try
+                    let stepped = transition action
+                    stepped, collectReadyWaiters (), None
                 with error ->
                     failProtocol None error
-                    raise (InvalidOperationException("Host protocol is faulted.", error)))
-        match result with
-        | Error error -> Error error
-        | Ok (effects, starts) -> launch starts; Ok effects
+                    Error ProtocolError.ForeignEpoch, collectReadyWaiters (), Some(InvalidOperationException("Host protocol is faulted.", error)))
+        notifyWaiters ready
+        match faultToRaise with
+        | Some fault -> raise fault
+        | None ->
+            match result with
+            | Error error -> Error error
+            | Ok (effects, starts) -> launch starts; Ok effects
+
+    /// Demands work for a single request and commits Action.Release synchronously
+    /// prior to invoking TrySetResult, TrySetException, or TrySetCanceled on the
+    /// outward Task. Cancelling one observer releases only its DemandId; each
+    /// concurrent request must supply a distinct DemandId.
+    member _.DemandAsync(demandId: DemandId, work: WorkId, ?cancellationToken: CancellationToken) : Task<Result<ResultHandle, HostDemandError>> =
+        let token = defaultArg cancellationToken CancellationToken.None
+        if token.IsCancellationRequested then
+            Task.FromCanceled<Result<ResultHandle, HostDemandError>>(token)
+        else
+            let tcs = TaskCompletionSource<Result<ResultHandle, HostDemandError>>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable releaseLatch = 0
+            let mutable registration = Unchecked.defaultof<CancellationTokenRegistration>
+            let mutable hasRegistration = 0
+            let unregister () =
+                if Interlocked.Exchange(&hasRegistration, 0) <> 0 then
+                    registration.Unregister() |> ignore
+            let mutable waiterRef: DemandWaiter option = None
+            let releaseSynchronously () =
+                let starts, ready, releaseFault =
+                    lock gate (fun () ->
+                        waiterRef |> Option.iter (fun waiter ->
+                            match waiter.Node with
+                            | Some node ->
+                                demandWaiters.Remove node
+                                waiter.Node <- None
+                            | None -> ())
+                        if protocolFault.IsSome then
+                            [], Array.empty, None
+                        else
+                            try
+                                match transition (Action.Release demandId) with
+                                | Ok (_, starts) -> starts, collectReadyWaiters (), None
+                                | Error error ->
+                                    let fault = InvalidOperationException($"Host/core protocol disagreement: {error}")
+                                    failProtocol None fault
+                                    [], collectReadyWaiters (), Some(InvalidOperationException("Host protocol is faulted.", fault))
+                            with error ->
+                                failProtocol None error
+                                [], collectReadyWaiters (), Some(InvalidOperationException("Host protocol is faulted.", error)))
+                launch starts
+                notifyWaiters ready
+                releaseFault
+            let resolveWaiter (outcome: Choice<Result<ResultHandle, HostDemandError>, exn>) =
+                if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                    let releaseFault = releaseSynchronously ()
+                    unregister ()
+                    match releaseFault, outcome with
+                    | Some fault, _ -> tcs.TrySetException(fault) |> ignore
+                    | None, Choice1Of2 result -> tcs.TrySetResult(result) |> ignore
+                    | None, Choice2Of2 fault -> tcs.TrySetException(fault) |> ignore
+            let waiter = { Work = work; Resolve = resolveWaiter; Node = None }
+            waiterRef <- Some waiter
+            let immediate, starts, ready =
+                lock gate (fun () ->
+                    match protocolFault with
+                    | Some error ->
+                        Some(Choice2Of2(InvalidOperationException("Host protocol is faulted.", error) :> exn)), [], Array.empty
+                    | None when closing.IsSome ->
+                        Some(Choice1Of2(Error HostDemandError.Closed)), [], Array.empty
+                    | None ->
+                        try
+                            match transition (Action.Demand(demandId, work)) with
+                            | Error error ->
+                                Some(Choice1Of2(Error(HostDemandError.InvalidCommand error))), [], Array.empty
+                            | Ok (_, demandStarts) ->
+                                match inspectDemand work with
+                                | DemandCheck.Pending ->
+                                    waiter.Node <- Some(demandWaiters.AddLast waiter)
+                                    None, demandStarts, collectReadyWaiters ()
+                                | DemandCheck.Ready outcome ->
+                                    None, demandStarts, [| waiter, Choice1Of2 outcome |]
+                                | DemandCheck.Faulted fault ->
+                                    None, demandStarts, [| waiter, Choice2Of2 fault |]
+                        with error ->
+                            failProtocol None error
+                            Some(Choice2Of2(InvalidOperationException("Host protocol is faulted.", error) :> exn)), [], collectReadyWaiters ())
+            launch starts
+            match immediate with
+            | Some(Choice1Of2 outcome) ->
+                notifyWaiters ready
+                Interlocked.Exchange(&releaseLatch, 1) |> ignore
+                tcs.TrySetResult(outcome) |> ignore
+            | Some(Choice2Of2 fault) ->
+                notifyWaiters ready
+                Interlocked.Exchange(&releaseLatch, 1) |> ignore
+                tcs.TrySetException(fault) |> ignore
+            | None ->
+                if ready.Length > 0 then
+                    notifyWaiters ready
+                if token.CanBeCanceled && Volatile.Read(&releaseLatch) = 0 then
+                    let cancelWithRelease () =
+                        if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                            match releaseSynchronously () with
+                            | Some fault -> tcs.TrySetException(fault) |> ignore
+                            | None -> tcs.TrySetCanceled(token) |> ignore
+                    let reg = token.Register(Action cancelWithRelease)
+                    registration <- reg
+                    Volatile.Write(&hasRegistration, 1)
+                    if Volatile.Read(&releaseLatch) <> 0 then
+                        unregister ()
+            tcs.Task
 
     member _.Snapshot = lock gate (fun () -> Core.snapshot state)
     member _.TryResult(work: WorkId) = lock gate (fun () -> if protocolFault.IsSome then None else Core.tryResult work state)
@@ -212,9 +385,9 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
     /// Retires the epoch and joins actual work. It does not forcefully preempt an
     /// evaluator that ignores its token. The owner must implement its cleanup contract.
     member _.CloseAsync() : Task =
-        let shared, completion, starts = lock gate (fun () ->
+        let shared, completion, starts, ready = lock gate (fun () ->
             match closing with
-            | Some work -> work, None, []
+            | Some work -> work, None, [], Array.empty
             | None ->
                 let completion = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
                 let shared = completion.Task :> Task
@@ -222,8 +395,9 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
                 // stable owner-visible operation joining the remaining work.
                 closing <- Some shared
                 let starts = lifecycle None Action.Retire
-                shared, Some completion, starts)
+                shared, Some completion, starts, collectReadyWaiters ())
         launch starts
+        notifyWaiters ready
         completion |> Option.iter (fun completion ->
             let finish: Task = task {
                 try

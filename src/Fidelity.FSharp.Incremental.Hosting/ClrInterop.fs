@@ -52,3 +52,69 @@ module ClrInterop =
     let toTask (observer: CancellationToken) (workflow: Async<'T>) : Task<'T> =
         Async.StartAsTask(workflow, cancellationToken = observer,
                           taskCreationOptions = TaskCreationOptions.RunContinuationsAsynchronously)
+
+    /// Observes a workflow as an outward Task while executing releaseSynchronously
+    /// atomically once via Interlocked.Exchange inside both terminal observation
+    /// and CancellationToken.Register callbacks prior to invoking TrySetResult,
+    /// TrySetException, or TrySetCanceled on the returned Task.
+    let observeWithRelease
+        (releaseSynchronously: unit -> unit)
+        (observer: CancellationToken)
+        (workflow: Async<'T>) : Task<'T> =
+        let tcs = TaskCompletionSource<'T>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable releaseLatch = 0
+        let mutable registration = Unchecked.defaultof<CancellationTokenRegistration>
+        let mutable hasRegistration = 0
+        let unregister () =
+            if Interlocked.Exchange(&hasRegistration, 0) <> 0 then
+                registration.Unregister() |> ignore
+        let cancelWithRelease () =
+            if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                try
+                    releaseSynchronously ()
+                    unregister ()
+                    tcs.TrySetCanceled(observer) |> ignore
+                with releaseFailure ->
+                    unregister ()
+                    tcs.TrySetException(releaseFailure) |> ignore
+        if observer.IsCancellationRequested then
+            cancelWithRelease ()
+            tcs.Task
+        else
+            if observer.CanBeCanceled then
+                let reg = observer.Register(Action cancelWithRelease)
+                registration <- reg
+                Volatile.Write(&hasRegistration, 1)
+                if Volatile.Read(&releaseLatch) <> 0 then
+                    unregister ()
+            if Volatile.Read(&releaseLatch) = 0 then
+                Async.StartWithContinuations(
+                    async {
+                        do! Async.SwitchToThreadPool()
+                        return! workflow
+                    },
+                    (fun value ->
+                        if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                            try
+                                releaseSynchronously ()
+                                unregister ()
+                                tcs.TrySetResult(value) |> ignore
+                            with releaseFailure ->
+                                unregister ()
+                                tcs.TrySetException(releaseFailure) |> ignore),
+                    (fun failure ->
+                        match failure with
+                        | :? OperationCanceledException when observer.IsCancellationRequested ->
+                            cancelWithRelease ()
+                        | _ ->
+                            if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                                try
+                                    releaseSynchronously ()
+                                    unregister ()
+                                    tcs.TrySetException(failure) |> ignore
+                                with releaseFailure ->
+                                    unregister ()
+                                    tcs.TrySetException(AggregateException(failure, releaseFailure)) |> ignore),
+                    (fun _ -> cancelWithRelease ()),
+                    cancellationToken = observer)
+            tcs.Task

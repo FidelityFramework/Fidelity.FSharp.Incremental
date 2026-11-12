@@ -47,6 +47,25 @@ type MailboxHost(epoch: EpochId, maxConcurrency: int, commandCapacity: int, eval
             | Error error -> Task.FromResult(Error error)
             | Ok operation -> ClrInterop.toTask token (AsyncMailbox.observe operation)
 
+    /// Demands work for a single request and enqueues Action.Release synchronously
+    /// on the coordinator FIFO inbox before completing the returned Task.
+    /// Each concurrent request must supply a distinct DemandId.
+    member _.DemandAsync(demandId: DemandId, work: WorkId, ?cancellationToken: CancellationToken) =
+        let token = defaultArg cancellationToken CancellationToken.None
+        AsyncMailbox.demandTask demandId work token handle
+
+    /// Runs observe under a request-scoped demand and enqueues Action.Release
+    /// synchronously on the coordinator FIFO inbox before completing the returned Task.
+    /// Each concurrent request must supply a distinct DemandId.
+    member _.WithDemandAsync<'T>(demandId: DemandId, work: WorkId, observe: CancellationToken -> Task<'T>, ?cancellationToken: CancellationToken) =
+        let token = defaultArg cancellationToken CancellationToken.None
+        AsyncMailbox.withDemandTask
+            demandId
+            work
+            (fun _ -> ClrInterop.fromUncancelledTask (fun () -> observe token))
+            token
+            handle
+
     member _.Snapshot = AsyncMailbox.snapshot handle
     member _.TryResult(work: WorkId) = AsyncMailbox.tryResult work handle
     member _.IsEligible(result: ResultHandle) = AsyncMailbox.isEligible result handle

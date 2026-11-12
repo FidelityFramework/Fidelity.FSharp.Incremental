@@ -3,6 +3,7 @@ namespace Fidelity.FSharp.Incremental.Hosting
 open System
 open System.Collections.Generic
 open System.Threading
+open System.Threading.Tasks
 open Fidelity.FSharp.Incremental
 
 /// Each return includes every owned child and cleanup operation. Cancellation is
@@ -484,3 +485,235 @@ module AsyncMailbox =
             let diagnostics = runtime.Diagnostics |> Seq.toList
             runtime.Diagnostics.Clear()
             diagnostics)
+
+    // Latched release for an already-admitted request-scoped demand bypasses the
+    // external CommandCapacity ceiling once so cancellation under burst saturation
+    // can never strand an admitted DemandId behind QueueFull.
+    let private enqueueRelease demandId runtime =
+        lock runtime.Gate (fun () ->
+            match runtime.Fault with
+            | Some error -> Error(MailboxError.Faulted error)
+            | None when not runtime.Accepting -> Error MailboxError.Closed
+            | None when not runtime.Started -> Error MailboxError.NotStarted
+            | None when runtime.Order = UInt64.MaxValue -> Error(MailboxError.InvalidCommand ProtocolError.IdentifierExhausted)
+            | None ->
+                runtime.Order <- runtime.Order + 1UL
+                let operation = { Order = runtime.Order; Outcome = AsyncCell.create () }
+                runtime.QueuedCommands <- runtime.QueuedCommands + 1
+                sendInternal (Command(Action.Release demandId, operation)) runtime
+                pulse runtime
+                Ok operation)
+
+    [<RequireQualifiedAccess>]
+    type private ScopedStep<'T> =
+        | Rejected of MailboxError
+        | Completed of 'T
+
+    let private runScopedDemandTask
+        (demandId: DemandId)
+        (work: WorkId)
+        (observeWork: Operation -> Async<'T>)
+        (mapRejected: MailboxError -> 'Out)
+        (mapCompleted: 'T -> Result<Operation, MailboxError> -> 'Out)
+        (cancellationToken: CancellationToken)
+        (handle: Handle) : Task<'Out> =
+        if cancellationToken.IsCancellationRequested then
+            Task.FromCanceled<'Out>(cancellationToken)
+        else
+            match admit (Action.Demand(demandId, work)) handle with
+            | Error error -> Task.FromResult(mapRejected error)
+            | Ok demandOperation ->
+                let runtime = handle.Runtime
+                let tcs = TaskCompletionSource<'Out>(TaskCreationOptions.RunContinuationsAsynchronously)
+                let mutable releaseLatch = 0
+                let mutable registration = Unchecked.defaultof<CancellationTokenRegistration>
+                let mutable hasRegistration = 0
+                let unregister () =
+                    if Interlocked.Exchange(&hasRegistration, 0) <> 0 then
+                        registration.Unregister() |> ignore
+                let cancelWithRelease () =
+                    if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                        let released = enqueueRelease demandId runtime
+                        unregister ()
+                        match released with
+                        | Ok _ | Error MailboxError.Closed ->
+                            tcs.TrySetCanceled(cancellationToken) |> ignore
+                        | Error releaseError ->
+                            tcs.TrySetException(MailboxReleaseException(demandId, releaseError)) |> ignore
+                if cancellationToken.CanBeCanceled then
+                    let reg = cancellationToken.Register(Action cancelWithRelease)
+                    registration <- reg
+                    Volatile.Write(&hasRegistration, 1)
+                    if Volatile.Read(&releaseLatch) <> 0 then
+                        unregister ()
+                if Volatile.Read(&releaseLatch) = 0 then
+                    let workflow = async {
+                        let! receipt = observe demandOperation
+                        match receipt with
+                        | Error error -> return ScopedStep.Rejected error
+                        | Ok _ ->
+                            let! value = observeWork demandOperation
+                            return ScopedStep.Completed value
+                    }
+                    Async.StartWithContinuations(
+                        async {
+                            do! Async.SwitchToThreadPool()
+                            return! workflow
+                        },
+                        (fun step ->
+                            match step with
+                            | ScopedStep.Rejected error ->
+                                if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                                    unregister ()
+                                    tcs.TrySetResult(mapRejected error) |> ignore
+                            | ScopedStep.Completed value ->
+                                if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                                    let released = enqueueRelease demandId runtime
+                                    unregister ()
+                                    tcs.TrySetResult(mapCompleted value released) |> ignore),
+                        (fun failure ->
+                            match failure with
+                            | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                                cancelWithRelease ()
+                            | _ ->
+                                if Interlocked.Exchange(&releaseLatch, 1) = 0 then
+                                    let released = enqueueRelease demandId runtime
+                                    unregister ()
+                                    match released with
+                                    | Ok _ | Error MailboxError.Closed ->
+                                        tcs.TrySetException(failure) |> ignore
+                                    | Error releaseError ->
+                                        let releaseFailure = MailboxReleaseException(demandId, releaseError) :> exn
+                                        tcs.TrySetException(AggregateException(failure, releaseFailure)) |> ignore),
+                        (fun _ -> cancelWithRelease ()),
+                        cancellationToken = cancellationToken)
+                tcs.Task
+
+    [<RequireQualifiedAccess>]
+    type private WorkObservation =
+        | Ready of Result<ResultHandle, MailboxDemandError>
+        | Closing of CloseOperation
+        | Pending of AsyncCell.Cell<unit>
+
+    let rec private waitWorkResult work handle = async {
+        let runtime = handle.Runtime
+        let step = lock runtime.Gate (fun () ->
+            match runtime.Fault with
+            | Some detail -> WorkObservation.Ready(Error(MailboxDemandError.Mailbox(MailboxError.Faulted detail)))
+            | None ->
+                match Core.tryResult work runtime.Published with
+                | Some result when Core.isEligible result runtime.Published ->
+                    WorkObservation.Ready(Ok result)
+                | _ when runtime.Closing ->
+                    WorkObservation.Closing runtime.Close
+                | _ ->
+                    match (Core.snapshot runtime.Published).Works |> List.tryFind (fun item -> item.Work = work) with
+                    | None -> WorkObservation.Ready(Error MailboxDemandError.WorkUnavailable)
+                    | Some { Status = WorkStatus.Eligible result } when Core.isEligible result runtime.Published ->
+                        WorkObservation.Ready(Ok result)
+                    | Some { Status = WorkStatus.Failed detail } ->
+                        WorkObservation.Ready(Error(MailboxDemandError.WorkFailed detail))
+                    | Some { Status = WorkStatus.Cancelled } ->
+                        WorkObservation.Ready(Error MailboxDemandError.WorkCancelled)
+                    | Some _ ->
+                        WorkObservation.Pending runtime.Changed)
+        match step with
+        | WorkObservation.Ready outcome -> return outcome
+        | WorkObservation.Closing closeOp ->
+            let! closed = awaitClose closeOp
+            return
+                match closed with
+                | Ok () -> Error(MailboxDemandError.Mailbox MailboxError.Closed)
+                | Error detail -> Error(MailboxDemandError.Mailbox(MailboxError.Faulted detail))
+        | WorkObservation.Pending signal ->
+            do! AsyncCell.observe signal
+            return! waitWorkResult work handle
+    }
+
+    let private awaitLatchedTask (token: CancellationToken) (pending: Task<'T>) : Async<'T> =
+        Async.FromContinuations(fun (success, error, cancelled) ->
+            pending.ContinueWith(
+                Action<Task<'T>>(fun completed ->
+                    if completed.IsCanceled then
+                        cancelled (OperationCanceledException token)
+                    elif completed.IsFaulted then
+                        let cause =
+                            match completed.Exception with
+                            | null -> InvalidOperationException("Scoped demand task faulted without an exception.") :> exn
+                            | aggregate when aggregate.InnerExceptions.Count = 1 -> aggregate.InnerException
+                            | aggregate -> aggregate :> exn
+                        error cause
+                    else
+                        success completed.Result),
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default) |> ignore)
+
+    /// Admits a request-scoped demand, runs observeWork after acknowledgement, and
+    /// enqueues Action.Release synchronously on the coordinator FIFO inbox before
+    /// invoking TrySetResult, TrySetException, or TrySetCanceled on the returned Task.
+    /// Each concurrent request must supply a distinct DemandId.
+    let withDemandTask
+        (demandId: DemandId)
+        (work: WorkId)
+        (observeWork: Operation -> Async<'T>)
+        (cancellationToken: CancellationToken)
+        (handle: Handle) : Task<Result<'T, MailboxError>> =
+        runScopedDemandTask
+            demandId
+            work
+            observeWork
+            Error
+            (fun value released ->
+                match released with
+                | Ok _ | Error MailboxError.Closed -> Ok value
+                | Error releaseError -> Error releaseError)
+            cancellationToken
+            handle
+
+    /// Functional Async counterpart to withDemandTask using the ambient cancellation token.
+    /// Each concurrent request must supply a distinct DemandId.
+    let withDemand
+        (demandId: DemandId)
+        (work: WorkId)
+        (observeWork: Operation -> Async<'T>)
+        (handle: Handle) : Async<Result<'T, MailboxError>> =
+        async {
+            let! token = Async.CancellationToken
+            let pending = withDemandTask demandId work observeWork token handle
+            return! awaitLatchedTask token pending
+        }
+
+    /// Admits a request-scoped demand for work, awaits an eligible ResultHandle or
+    /// terminal status, and enqueues Action.Release synchronously on the coordinator
+    /// FIFO inbox prior to completing the returned Task.
+    /// Each concurrent request must supply a distinct DemandId.
+    let demandTask
+        (demandId: DemandId)
+        (work: WorkId)
+        (cancellationToken: CancellationToken)
+        (handle: Handle) : Task<Result<ResultHandle, MailboxDemandError>> =
+        runScopedDemandTask
+            demandId
+            work
+            (fun _ -> waitWorkResult work handle)
+            (MailboxDemandError.Mailbox >> Error)
+            (fun outcome released ->
+                match outcome, released with
+                | _, Error MailboxError.Closed -> outcome
+                | _, Error releaseError -> Error(MailboxDemandError.Mailbox releaseError)
+                | result, Ok _ -> result)
+            cancellationToken
+            handle
+
+    /// Functional Async counterpart to demandTask using the ambient cancellation token.
+    /// Each concurrent request must supply a distinct DemandId.
+    let demand
+        (demandId: DemandId)
+        (work: WorkId)
+        (handle: Handle) : Async<Result<ResultHandle, MailboxDemandError>> =
+        async {
+            let! token = Async.CancellationToken
+            let pending = demandTask demandId work token handle
+            return! awaitLatchedTask token pending
+        }

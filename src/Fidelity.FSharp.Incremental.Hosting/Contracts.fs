@@ -1,5 +1,6 @@
 namespace Fidelity.FSharp.Incremental.Hosting
 
+open System
 open Fidelity.FSharp.Incremental
 
 type HostDiagnostic = { Attempt: AttemptId; Failure: Failure }
@@ -35,3 +36,25 @@ type MailboxSnapshot = {
     Suspensions: SuspensionHandle list
     IsClosing: bool
 }
+
+[<RequireQualifiedAccess>]
+type HostDemandError =
+    | InvalidCommand of ProtocolError
+    | WorkFailed of Failure
+    | WorkCancelled
+    | WorkUnavailable
+    | Closed
+
+[<RequireQualifiedAccess>]
+type MailboxDemandError =
+    | Mailbox of MailboxError
+    | WorkFailed of Failure
+    | WorkCancelled
+    | WorkUnavailable
+
+/// Raised when synchronous Action.Release admission fails with an error other than
+/// MailboxError.Closed while cancelling or faulting an admitted request-scoped demand.
+type MailboxReleaseException(demandId: DemandId, error: MailboxError) =
+    inherit InvalidOperationException(sprintf "Failed to enqueue synchronous demand release for %A: %A" demandId error)
+    member _.DemandId = demandId
+    member _.MailboxError = error
