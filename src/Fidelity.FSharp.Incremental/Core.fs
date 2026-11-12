@@ -13,6 +13,12 @@ module Core =
         Reads: ResolvedRead list
     }
 
+    type private InvalidationCause = {
+        Trigger: CausalTrigger
+        InvalidatedSlot: ReadSlotId option
+        SourceWork: WorkId option
+    }
+
     type private Work = {
         Scope: ScopeId
         Definition: Definition
@@ -21,6 +27,7 @@ module Core =
         Current: AttemptId option
         Failure: Failure option
         Cancelled: bool
+        LastInvalidation: InvalidationCause option
     }
 
     type private Attempt = {
@@ -79,16 +86,29 @@ module Core =
             | ReadSource.Work id -> Some id
             | ReadSource.Input _ -> None)
 
-    let private reverseClosure (roots: Set<WorkId>) (state: State) =
-        let rec expand visited =
+    let private reverseClosureWithCauses (rootCauses: Map<WorkId, InvalidationCause>) (state: State) =
+        let rec expand (found: Map<WorkId, InvalidationCause>) =
             let next =
                 state.Works
-                |> Map.fold (fun found id work ->
-                    if dependencies work |> List.exists (fun dep -> Set.contains dep visited) then
-                        Set.add id found
-                    else found) visited
-            if next = visited then visited else expand next
-        expand roots
+                |> Map.fold (fun acc id work ->
+                    if Map.containsKey id acc then acc
+                    else
+                        let inherited =
+                            work.Definition.Reads
+                            |> List.tryPick (fun read ->
+                                match read.Source with
+                                | ReadSource.Work upstream ->
+                                    Map.tryFind upstream acc
+                                    |> Option.map (fun cause ->
+                                        { Trigger = cause.Trigger
+                                          InvalidatedSlot = Some read.Slot
+                                          SourceWork = Some upstream })
+                                | ReadSource.Input _ -> None)
+                        match inherited with
+                        | Some cause -> Map.add id cause acc
+                        | None -> acc) found
+            if next = found then found else expand next
+        expand rootCauses
 
     let private demanded (state: State) =
         let rec visit visited id =
@@ -162,7 +182,8 @@ module Core =
             { state with Attempts = Map.add id updated state.Attempts }, effects
 
     // Retained completed values are candidates only; their old handle is withdrawn.
-    let private invalidate (ids: Set<WorkId>) (state: State) =
+    let private invalidateWithCauses (causes: Map<WorkId, InvalidationCause>) (state: State) =
+        let ids = causes |> Map.toList |> List.map fst |> Set.ofList
         let withdrawals =
             ids
             |> Set.toList
@@ -171,12 +192,28 @@ module Core =
                 |> Option.bind (fun work -> work.Offered)
                 |> Option.map (EffectAction.Withdraw >> effect state))
         let cleared =
-            ids
-            |> Set.fold (fun current id ->
+            causes
+            |> Map.fold (fun current id cause ->
                 match Map.tryFind id current.Works with
                 | None -> current
                 | Some work ->
-                    let changed = { work with Offered = None; Current = None; Failure = None; Cancelled = false }
+                    let hadPriorExecution =
+                        Option.isSome work.Offered
+                        || Option.isSome work.Cached
+                        || Option.isSome work.Current
+                        || Option.isSome work.Failure
+                        || work.Cancelled
+                        || not (List.isEmpty (pendingForWork id current))
+                    let recordedCause =
+                        if hadPriorExecution then Some cause else work.LastInvalidation
+                    let changed = {
+                        work with
+                            Offered = None
+                            Current = None
+                            Failure = None
+                            Cancelled = false
+                            LastInvalidation = recordedCause
+                    }
                     { current with Works = Map.add id changed current.Works }) state
         let stateAfter, cancellations =
             state.Attempts
@@ -219,7 +256,7 @@ module Core =
         ]
         next, effects
 
-    let private advance (initial: State) =
+    let private advance (labels: Map<WorkId * ReadSlotId, string>) (initial: State) =
         let demand = demanded initial
         let unnecessary =
             initial.Works
@@ -237,17 +274,17 @@ module Core =
         match topological state.Works with
         | Error error -> Error error
         | Ok order ->
-            let rec schedule current output = function
+            let rec schedule current output causes = function
                 | [] ->
                     let final, closures = finishClosures current
-                    Ok(final, output @ closures)
+                    Ok(final, output @ closures, causes)
                 | id :: rest ->
                     let work = Map.find id current.Works
                     match scopeOpen work.Scope current, resolve work current with
                     | Some revision, Some reads when not current.Retiring ->
                         if Option.isSome work.Offered || Option.isSome work.Current
                            || not (List.isEmpty (pendingForWork id current)) then
-                            schedule current output rest
+                            schedule current output causes rest
                         else
                             match work.Cached with
                             | Some cached when cached.Reads = reads ->
@@ -261,9 +298,9 @@ module Core =
                                     let next = {
                                         current with
                                             NextEligibility = current.NextEligibility + 1UL
-                                            Works = Map.add id { work with Offered = Some handle } current.Works
+                                            Works = Map.add id { work with Offered = Some handle; LastInvalidation = None } current.Works
                                     }
-                                    schedule next (output @ [effect next (EffectAction.Offer handle)]) rest
+                                    schedule next (output @ [effect next (EffectAction.Offer handle)]) causes rest
                             | _ when Set.contains id demand && Option.isNone work.Failure && not work.Cancelled ->
                                 if current.NextAttempt = identifierLimit then Error ProtocolError.IdentifierExhausted
                                 else
@@ -277,16 +314,33 @@ module Core =
                                         Suspension = None
                                         Obsolete = false; CancelSent = false; DrainSent = false
                                     }
+                                    let emittedCauses =
+                                        match work.LastInvalidation with
+                                        | None -> causes
+                                        | Some cause ->
+                                            let label =
+                                                cause.InvalidatedSlot
+                                                |> Option.bind (fun slot -> Map.tryFind (id, slot) labels)
+                                            let edge = {
+                                                Epoch = current.Epoch
+                                                Trigger = cause.Trigger
+                                                InvalidatedSlot = cause.InvalidatedSlot
+                                                SourceWork = cause.SourceWork
+                                                AffectedWork = id
+                                                RestartedAttempt = Some attemptId
+                                                Label = label
+                                            }
+                                            causes @ [edge]
                                     let next = {
                                         current with
                                             NextAttempt = current.NextAttempt + 1UL
-                                            Works = Map.add id { work with Current = Some attemptId } current.Works
+                                            Works = Map.add id { work with Current = Some attemptId; LastInvalidation = None } current.Works
                                             Attempts = Map.add attemptId attempt current.Attempts
                                     }
-                                    schedule next (output @ [effect next (EffectAction.Start request)]) rest
-                            | _ -> schedule current output rest
-                    | _ -> schedule current output rest
-            schedule state cancelled order
+                                    schedule next (output @ [effect next (EffectAction.Start request)]) emittedCauses rest
+                            | _ -> schedule current output causes rest
+                    | _ -> schedule current output causes rest
+            schedule state cancelled [] order
 
     let private reserve scope revision (state: State) =
         let validation =
@@ -302,9 +356,17 @@ module Core =
         | Error error -> Error error
         | Ok true -> Ok(state, [])
         | Ok false ->
-            let roots =
-                state.Works |> Map.toList |> List.choose (fun (id, work) -> if work.Scope = scope then Some id else None) |> Set.ofList
-            let changed, effects = invalidate (reverseClosure roots state) state
+            let rootCauses =
+                state.Works
+                |> Map.fold (fun acc id work ->
+                    if work.Scope = scope then
+                        Map.add id {
+                            Trigger = CausalTrigger.ScopeReserved(scope, revision)
+                            InvalidatedSlot = None
+                            SourceWork = None
+                        } acc
+                    else acc) Map.empty
+            let changed, effects = invalidateWithCauses (reverseClosureWithCauses rootCauses state) state
             Ok({ changed with Scopes = Map.add scope (ScopePhase.Reserved revision) changed.Scopes }, effects)
 
     let private validateReads (definition: Definition) =
@@ -335,10 +397,12 @@ module Core =
                                     if Set.contains (id, definition.Stamp) state.DefinitionStamps then
                                         Error(ProtocolError.DefinitionStampReused id)
                                     else
+                                        let inheritedCause = existing |> Option.bind (fun old -> old.LastInvalidation)
                                         validateReads definition
                                         |> Result.map (fun () ->
                                             { Scope = scope; Definition = definition; Offered = None; Cached = None
-                                              Current = None; Failure = None; Cancelled = false },
+                                              Current = None; Failure = None; Cancelled = false
+                                              LastInvalidation = inheritedCause },
                                             Set.add (id, definition.Stamp) stamps)
                             match chosen with
                             | Error error -> Error error
@@ -374,33 +438,51 @@ module Core =
                         Error(ProtocolError.InputStampReused value.Input)
                     else
                         validate (Set.add value.Input seen)
-                            (if duplicate then changed else Set.add value.Input changed)
+                            (if duplicate then changed else Map.add value.Input value.Stamp changed)
                             (Map.add value.Input value inputs) (Set.add (value.Input, value.Stamp) stamps) rest
-        match validate Set.empty Set.empty state.Inputs state.InputStamps values with
+        match validate Set.empty Map.empty state.Inputs state.InputStamps values with
         | Error error -> Error error
         | Ok(changed, inputs, stamps) ->
-            let roots =
+            let rootCauses =
                 state.Works
-                |> Map.toList
-                |> List.choose (fun (id, work) ->
-                    if work.Definition.Reads |> List.exists (fun read ->
-                        match read.Source with ReadSource.Input input -> Set.contains input changed | _ -> false)
-                    then Some id else None)
-                |> Set.ofList
-            let invalidated, effects = invalidate (reverseClosure roots state) state
+                |> Map.fold (fun acc id work ->
+                    let hit =
+                        work.Definition.Reads
+                        |> List.tryPick (fun read ->
+                            match read.Source with
+                            | ReadSource.Input input ->
+                                Map.tryFind input changed
+                                |> Option.map (fun stamp ->
+                                    { Trigger = CausalTrigger.InputChanged(input, stamp)
+                                      InvalidatedSlot = Some read.Slot
+                                      SourceWork = None })
+                            | ReadSource.Work _ -> None)
+                    match hit with
+                    | Some cause -> Map.add id cause acc
+                    | None -> acc) Map.empty
+            let invalidated, effects = invalidateWithCauses (reverseClosureWithCauses rootCauses state) state
             Ok({ invalidated with Inputs = inputs; InputStamps = stamps }, effects)
 
     let private removeInputs ids (state: State) =
         let removed = ids |> List.filter (fun id -> Map.containsKey id state.Inputs) |> Set.ofList
-        let roots =
+        let rootCauses =
             state.Works
-            |> Map.toList
-            |> List.choose (fun (id, work) ->
-                if work.Definition.Reads |> List.exists (fun read ->
-                    match read.Source with ReadSource.Input input -> Set.contains input removed | _ -> false)
-                then Some id else None)
-            |> Set.ofList
-        let invalidated, effects = invalidate (reverseClosure roots state) state
+            |> Map.fold (fun acc id work ->
+                let hit =
+                    work.Definition.Reads
+                    |> List.tryPick (fun read ->
+                        match read.Source with
+                        | ReadSource.Input input when Set.contains input removed ->
+                            Some {
+                                Trigger = CausalTrigger.InputRemoved input
+                                InvalidatedSlot = Some read.Slot
+                                SourceWork = None
+                            }
+                        | _ -> None)
+                match hit with
+                | Some cause -> Map.add id cause acc
+                | None -> acc) Map.empty
+        let invalidated, effects = invalidateWithCauses (reverseClosureWithCauses rootCauses state) state
         let inputs = removed |> Set.fold (fun all id -> Map.remove id all) invalidated.Inputs
         Ok({ invalidated with Inputs = inputs }, effects)
 
@@ -516,7 +598,15 @@ module Core =
         | Some _ ->
             let owned =
                 state.Works |> Map.toList |> List.choose (fun (id, work) -> if work.Scope = scope then Some id else None) |> Set.ofList
-            let invalidated, effects = invalidate (reverseClosure owned state) state
+            let rootCauses =
+                owned
+                |> Set.fold (fun acc id ->
+                    Map.add id {
+                        Trigger = CausalTrigger.ScopeClosed scope
+                        InvalidatedSlot = None
+                        SourceWork = None
+                    } acc) Map.empty
+            let invalidated, effects = invalidateWithCauses (reverseClosureWithCauses rootCauses state) state
             let released =
                 invalidated.Demands |> Map.toList |> List.choose (fun (id, work) -> if Set.contains work owned then Some id else None)
             let next = {
@@ -571,8 +661,9 @@ module Core =
         | Action.CloseScope scope -> close scope state
         | Action.Retire -> retire state
 
-    /// Validate, update immutable state, and then produce deterministic host effects.
-    let step (command: Command) (state: State) =
+    /// Validate, update immutable state, and produce deterministic host effects plus
+    /// causal restart edges annotated with any matching slot labels.
+    let stepWithCauses (labels: Map<WorkId * ReadSlotId, string>) (command: Command) (state: State) =
         if command.Epoch <> state.Epoch then Error ProtocolError.ForeignEpoch
         else
             let permitted =
@@ -584,7 +675,13 @@ module Core =
                 match apply command.Action state with
                 | Error error -> Error error
                 | Ok(changed, effects) ->
-                    advance changed |> Result.map (fun (next, scheduled) -> next, effects @ scheduled)
+                    advance labels changed
+                    |> Result.map (fun (next, scheduled, causes) -> next, effects @ scheduled, causes)
+
+    /// Validate, update immutable state, and then produce deterministic host effects.
+    let step (command: Command) (state: State) =
+        stepWithCauses Map.empty command state
+        |> Result.map (fun (next, effects, _) -> next, effects)
 
     let tryResult work (state: State) =
         Map.tryFind work state.Works |> Option.bind (fun found -> found.Offered)

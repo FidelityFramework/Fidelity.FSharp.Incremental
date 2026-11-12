@@ -10,13 +10,17 @@ type StepEvaluator = StepInvocation -> CancellationToken -> Task<StepOutcome>
 
 /// CLR adapter over AsyncMailbox. Construction starts the coordinator for
 /// compatibility; functional callers use explicit create/start/admit operations.
-type MailboxHost(epoch: EpochId, maxConcurrency: int, commandCapacity: int, evaluator: StepEvaluator) =
+type MailboxHost private (epoch: EpochId, maxConcurrency: int, commandCapacity: int, evaluator: StepEvaluator, journalOpt: IInputJournal option) =
     let handle =
         let settings: AsyncMailbox.Settings = {
             Epoch = epoch; MaxConcurrency = maxConcurrency; CommandCapacity = commandCapacity
         }
         let workflow invocation cancellation = ClrInterop.fromTask (evaluator invocation) cancellation
-        match AsyncMailbox.create settings workflow with
+        let created =
+            match journalOpt with
+            | None -> AsyncMailbox.create settings workflow
+            | Some journal -> AsyncMailbox.createWithJournal settings journal workflow
+        match created with
         | Ok value -> value
         | Error AsyncMailbox.ConfigurationError.InvalidConcurrency ->
             invalidArg (nameof maxConcurrency) "Concurrency must be positive."
@@ -33,9 +37,17 @@ type MailboxHost(epoch: EpochId, maxConcurrency: int, commandCapacity: int, eval
     }
 
     do
+        journalOpt |> Option.iter (fun journal -> journal.BeginEpoch epoch)
         match AsyncMailbox.start handle with
         | Ok () -> ()
         | Error error -> invalidOp $"Could not start mailbox: {error}"
+
+    new(epoch: EpochId, maxConcurrency: int, commandCapacity: int, evaluator: StepEvaluator) =
+        new MailboxHost(epoch, maxConcurrency, commandCapacity, evaluator, None)
+
+    new(epoch: EpochId, maxConcurrency: int, commandCapacity: int, evaluator: StepEvaluator, journal: IInputJournal) =
+        if isNull (box journal) then nullArg (nameof journal)
+        new MailboxHost(epoch, maxConcurrency, commandCapacity, evaluator, Some journal)
 
     /// Admission occurs at invocation, before any reply observation begins.
     member _.PostAsync(action: Action, ?cancellationToken: CancellationToken) =

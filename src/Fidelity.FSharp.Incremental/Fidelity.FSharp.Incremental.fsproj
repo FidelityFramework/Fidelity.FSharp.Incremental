@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="API.fs" />
+    <Compile Include="Trace.fs" />
     <Compile Include="Core.fs" />
   </ItemGroup>
 </Project>

@@ -230,6 +230,11 @@ type Host internal (epoch: EpochId, maxConcurrency: int, evaluator: Evaluator,
     new(epoch: EpochId, maxConcurrency: int, evaluator: Evaluator) =
         new Host(epoch, maxConcurrency, evaluator, Core.step)
 
+    new(epoch: EpochId, maxConcurrency: int, evaluator: Evaluator, journal: IInputJournal) =
+        if isNull (box journal) then nullArg (nameof journal)
+        journal.BeginEpoch epoch
+        new Host(epoch, maxConcurrency, evaluator, Journal.step journal)
+
     /// Applies a command atomically. Reservation withdraws eligibility before returning.
     /// Step suspension/resumption requires MailboxHost. Lifecycle acknowledgements
     /// belong to the host and cannot be supplied by its caller.

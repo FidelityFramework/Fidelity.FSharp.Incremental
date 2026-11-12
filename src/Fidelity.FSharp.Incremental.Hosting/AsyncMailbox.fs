@@ -71,6 +71,7 @@ module AsyncMailbox =
         mutable QueuedCommands: int
         mutable QueuedSteps: int
         mutable PublishedRunning: int
+        mutable PublishedQuiescent: bool
         mutable Running: int
         mutable Order: uint64
         mutable Started: bool
@@ -101,6 +102,11 @@ module AsyncMailbox =
             |> Seq.filter (fun entry -> entry.Queued && not entry.CancelRequested)
             |> Seq.length
         runtime.PublishedRunning <- runtime.Running
+        runtime.PublishedQuiescent <-
+            runtime.Entries.Values
+            |> Seq.forall (fun entry ->
+                not entry.Active && not entry.Queued && not entry.CancelRequested
+                && entry.CancellationDone && entry.Terminal.IsNone)
         for effect in runtime.PendingEvents do runtime.Events.Enqueue effect
         runtime.PendingEvents.Clear()
         pulse runtime)
@@ -328,6 +334,7 @@ module AsyncMailbox =
                 QueuedCommands = 0
                 QueuedSteps = 0
                 PublishedRunning = 0
+                PublishedQuiescent = true
                 Running = 0
                 Order = 0UL
                 Started = false
@@ -339,6 +346,11 @@ module AsyncMailbox =
 
     /// Validate a cold description. No coordinator or evaluator starts here.
     let create settings evaluator = createWithStep settings evaluator Core.step
+
+    /// Validate a cold description wired to a boundary command journal.
+    let createWithJournal settings (journal: IInputJournal) evaluator =
+        if isNull (box journal) then nullArg (nameof journal)
+        createWithStep settings evaluator (Journal.step journal)
 
     /// Start the owned coordinator once. A closed handle cannot be restarted.
     let start handle =
@@ -460,6 +472,14 @@ module AsyncMailbox =
     let watch handle =
         let runtime = handle.Runtime
         lock runtime.Gate (fun () -> readSnapshot runtime, AsyncCell.observe runtime.Changed)
+
+    // Published with the coordinator state, so terminal ownership cannot be
+    // mistaken for an externally resumable suspension.
+    let internal watchQuiescence handle =
+        let runtime = handle.Runtime
+        lock runtime.Gate (fun () ->
+            runtime.QueuedCommands = 0 && runtime.PublishedQuiescent,
+            AsyncCell.observe runtime.Changed)
 
     let tryResult work handle =
         let runtime = handle.Runtime

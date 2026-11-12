@@ -16,5 +16,6 @@
     <Compile Include="FunctionalTests.fs" />
     <Compile Include="ClrInteropTests.fs" />
     <Compile Include="DemandReleaseTests.fs" />
+    <Compile Include="JournalAndTraceTests.fs" />
   </ItemGroup>
 </Project>

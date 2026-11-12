@@ -179,9 +179,36 @@ type Snapshot = {
     Works: WorkView list
 }
 
+/// Root invalidation trigger for causal explanation queries.
+[<RequireQualifiedAccess>]
+type CausalTrigger =
+    | InputChanged of InputId * InputStamp
+    | InputRemoved of InputId
+    | ScopeReserved of ScopeId * RevisionId
+    | ScopeClosed of ScopeId
+
+/// Lazy label evaluated only when causal tracing is active.
+type TraceLabel = {
+    Work: WorkId
+    Slot: ReadSlotId
+    Label: string
+}
+
+/// Causal edge linking an invalidation trigger and slot to a restarted work attempt.
+type CausalEdge = {
+    Epoch: EpochId
+    Trigger: CausalTrigger
+    InvalidatedSlot: ReadSlotId option
+    SourceWork: WorkId option
+    AffectedWork: WorkId
+    RestartedAttempt: AttemptId option
+    Label: string option
+}
+
 // Core.fs will expose an opaque Core.State and these functions:
 // Core.init : EpochId -> Core.State
 // Core.step : Command -> Core.State -> Result<Core.State * Effect list, ProtocolError>
+// Core.stepWithCauses : Map<WorkId * ReadSlotId, string> -> Command -> Core.State -> Result<Core.State * Effect list * CausalEdge list, ProtocolError>
 // Core.snapshot : Core.State -> Snapshot
 // Core.tryResult : WorkId -> Core.State -> ResultHandle option
 // Core.trySuspension : AttemptId -> Core.State -> SuspensionHandle option
